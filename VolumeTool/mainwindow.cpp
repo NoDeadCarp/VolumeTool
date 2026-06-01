@@ -85,6 +85,7 @@ MainWindow::MainWindow(QWidget *parent)
       showVirtualCheck(new QCheckBox(QStringLiteral("显示虚拟设备"), this)),
       slider(new QSlider(Qt::Horizontal, this)),
       label(new QLabel(QStringLiteral("音量控制"), this)),
+      syncModeHintLabel(new QLabel(QStringLiteral("已开启 Windows 音量同步，请到“设置”页的“同步设备”中勾选需要联动的设备。"), this)),
       autoStartCheck(new QCheckBox(QStringLiteral("开机自启"), this)),
       restartAudioEngineCheck(new QCheckBox(QStringLiteral("设备变动时重启 audio engine"), this)),
       syncWindowsVolumeCheck(new QCheckBox(QStringLiteral("同步 Windows 音量滑轨"), this)),
@@ -123,9 +124,13 @@ void MainWindow::setupUi()
 {
     auto *controlLayout = new QVBoxLayout(controlPage);
     slider->setRange(0, 100);
+    syncModeHintLabel->setWordWrap(true);
+    syncModeHintLabel->setStyleSheet(QStringLiteral("color: #b45309;"));
+    syncModeHintLabel->hide();
 
     controlLayout->addWidget(showVirtualCheck);
     controlLayout->addWidget(deviceBox);
+    controlLayout->addWidget(syncModeHintLabel);
     controlLayout->addWidget(label);
     controlLayout->addWidget(slider);
     controlLayout->addStretch();
@@ -155,6 +160,7 @@ void MainWindow::setupUi()
 
     syncDeviceList->setEnabled(false);
     syncDeviceHintLabel->setEnabled(false);
+    updateControlLockState();
 }
 
 void MainWindow::initAudio()
@@ -277,16 +283,20 @@ void MainWindow::refreshDevices(bool showVirtual)
         }
 
         PROPVARIANT varName;
-        PROPVARIANT varId;
         PropVariantInit(&varName);
-        PropVariantInit(&varId);
 
         const HRESULT nameHr = props->GetValue(PKEY_Device_FriendlyName, &varName);
-        const HRESULT idHr = props->GetValue(PKEY_Device_InstanceId, &varId);
-        if (FAILED(nameHr) || FAILED(idHr) || varName.vt != VT_LPWSTR || !varName.pwszVal
-            || varId.vt != VT_LPWSTR || !varId.pwszVal) {
+        if (FAILED(nameHr) || varName.vt != VT_LPWSTR || !varName.pwszVal) {
             PropVariantClear(&varName);
-            PropVariantClear(&varId);
+            props->Release();
+            device->Release();
+            continue;
+        }
+
+        LPWSTR rawDeviceId = nullptr;
+        const HRESULT idHr = device->GetId(&rawDeviceId);
+        if (FAILED(idHr) || !rawDeviceId) {
+            PropVariantClear(&varName);
             props->Release();
             device->Release();
             continue;
@@ -299,14 +309,14 @@ void MainWindow::refreshDevices(bool showVirtual)
                               reinterpret_cast<void **>(&volume));
         if (FAILED(hr) || !volume) {
             PropVariantClear(&varName);
-            PropVariantClear(&varId);
+            CoTaskMemFree(rawDeviceId);
             props->Release();
             device->Release();
             continue;
         }
 
         DeviceItem item;
-        item.id = QString::fromWCharArray(varId.pwszVal);
+        item.id = QString::fromWCharArray(rawDeviceId);
         item.name = QString::fromWCharArray(varName.pwszVal);
         item.device = device;
         item.volume = volume;
@@ -315,7 +325,7 @@ void MainWindow::refreshDevices(bool showVirtual)
         deviceBox->addItem(item.name);
 
         PropVariantClear(&varName);
-        PropVariantClear(&varId);
+        CoTaskMemFree(rawDeviceId);
         props->Release();
     }
 
@@ -339,17 +349,91 @@ void MainWindow::updateSyncDeviceList()
 
     syncDeviceList->clear();
 
-    for (const auto &device : devices) {
-        auto *item = new QListWidgetItem(device.name, syncDeviceList);
-        item->setData(Qt::UserRole, device.id);
-        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-        item->setCheckState(previouslyChecked.contains(device.id) ? Qt::Checked : Qt::Unchecked);
+    IMMDeviceEnumerator *enumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                  nullptr,
+                                  CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator),
+                                  reinterpret_cast<void **>(&enumerator));
+    if (FAILED(hr) || !enumerator) {
+        auto *item = new QListWidgetItem(QStringLiteral("无法读取设备列表"), syncDeviceList);
+        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        return;
     }
 
-    if (devices.empty()) {
+    IMMDeviceCollection *collection = nullptr;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+    if (FAILED(hr) || !collection) {
+        enumerator->Release();
+        auto *item = new QListWidgetItem(QStringLiteral("无法读取设备列表"), syncDeviceList);
+        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        return;
+    }
+
+    UINT count = 0;
+    hr = collection->GetCount(&count);
+    if (FAILED(hr)) {
+        collection->Release();
+        enumerator->Release();
+        auto *item = new QListWidgetItem(QStringLiteral("无法读取设备列表"), syncDeviceList);
+        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        return;
+    }
+
+    for (UINT i = 0; i < count; ++i) {
+        IMMDevice *device = nullptr;
+        hr = collection->Item(i, &device);
+        if (FAILED(hr) || !device) {
+            continue;
+        }
+
+        IPropertyStore *props = nullptr;
+        hr = device->OpenPropertyStore(STGM_READ, &props);
+        if (FAILED(hr) || !props) {
+            device->Release();
+            continue;
+        }
+
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        const HRESULT nameHr = props->GetValue(PKEY_Device_FriendlyName, &varName);
+
+        LPWSTR rawDeviceId = nullptr;
+        const HRESULT idHr = device->GetId(&rawDeviceId);
+
+        if (SUCCEEDED(nameHr) && varName.vt == VT_LPWSTR && varName.pwszVal
+            && SUCCEEDED(idHr) && rawDeviceId) {
+            auto *item = new QListWidgetItem(QString::fromWCharArray(varName.pwszVal), syncDeviceList);
+            item->setData(Qt::UserRole, QString::fromWCharArray(rawDeviceId));
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(previouslyChecked.contains(item->data(Qt::UserRole).toString())
+                                    ? Qt::Checked
+                                    : Qt::Unchecked);
+        }
+
+        if (rawDeviceId) {
+            CoTaskMemFree(rawDeviceId);
+        }
+        PropVariantClear(&varName);
+        props->Release();
+        device->Release();
+    }
+
+    collection->Release();
+    enumerator->Release();
+
+    if (syncDeviceList->count() == 0) {
         auto *item = new QListWidgetItem(QStringLiteral("当前没有可供选择的输出设备"), syncDeviceList);
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
     }
+}
+
+void MainWindow::updateControlLockState()
+{
+    const bool syncEnabled = syncWindowsVolumeCheck->isChecked();
+    deviceBox->setEnabled(!syncEnabled);
+    showVirtualCheck->setEnabled(!syncEnabled);
+    syncModeHintLabel->setVisible(syncEnabled);
 }
 
 void MainWindow::registerVolumeCallbackForCurrentDevice()
@@ -488,6 +572,7 @@ void MainWindow::onSliderChanged(int value)
 void MainWindow::loadDevices(bool showVirtual)
 {
     refreshDevices(showVirtual);
+    updateControlLockState();
 
     if (devices.empty()) {
         onDeviceChanged(-1);
@@ -503,6 +588,7 @@ void MainWindow::onSyncWindowsVolumeToggled(bool checked)
 {
     syncDeviceHintLabel->setEnabled(checked);
     syncDeviceList->setEnabled(checked);
+    updateControlLockState();
     registerVolumeCallbackForCurrentDevice();
 }
 
@@ -520,23 +606,25 @@ bool MainWindow::isVirtualDevice(IMMDevice *device)
     }
 
     PROPVARIANT varName;
-    PROPVARIANT varId;
     PropVariantInit(&varName);
-    PropVariantInit(&varId);
 
     const HRESULT nameHr = props->GetValue(PKEY_Device_FriendlyName, &varName);
-    const HRESULT idHr = props->GetValue(PKEY_Device_InstanceId, &varId);
 
     const QString name = (SUCCEEDED(nameHr) && varName.vt == VT_LPWSTR && varName.pwszVal)
         ? QString::fromWCharArray(varName.pwszVal)
         : QString();
-    const QString id = (SUCCEEDED(idHr) && varId.vt == VT_LPWSTR && varId.pwszVal)
-        ? QString::fromWCharArray(varId.pwszVal)
+
+    LPWSTR rawDeviceId = nullptr;
+    const HRESULT idHr = device->GetId(&rawDeviceId);
+    const QString id = (SUCCEEDED(idHr) && rawDeviceId)
+        ? QString::fromWCharArray(rawDeviceId)
         : QString();
 
     props->Release();
     PropVariantClear(&varName);
-    PropVariantClear(&varId);
+    if (rawDeviceId) {
+        CoTaskMemFree(rawDeviceId);
+    }
 
     return name.contains("Virtual", Qt::CaseInsensitive)
         || name.contains("VB-Audio", Qt::CaseInsensitive)

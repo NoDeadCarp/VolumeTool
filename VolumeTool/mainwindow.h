@@ -58,6 +58,7 @@ private:
     QCheckBox *showVirtualCheck;
     QSlider *slider;
     QLabel *label;
+    QLabel *syncModeHintLabel;
 
     QCheckBox *autoStartCheck;
     QCheckBox *restartAudioEngineCheck;
@@ -78,6 +79,7 @@ private:
     void clearDevices();
     void refreshDevices(bool showVirtual);
     void updateSyncDeviceList();
+    void updateControlLockState();
     void loadSettings();
     void updateAutoStart(bool enabled);
     void registerVolumeCallbackForCurrentDevice();
