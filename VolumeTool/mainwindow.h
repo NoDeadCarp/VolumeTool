@@ -85,6 +85,9 @@ private:
     void registerVolumeCallbackForCurrentDevice();
     void unregisterVolumeCallback();
     void applyVolumeToSelectedDevices(float volumeScalar);
+    bool setDeviceVolumeById(const QString &deviceId, float volumeScalar);
+    bool getDefaultRenderEndpoint(IAudioEndpointVolume **volume, QString *deviceId = nullptr);
+    bool getDefaultRenderVolume(float *volumeScalar);
     QString applicationDisplayName() const;
 
 private slots:

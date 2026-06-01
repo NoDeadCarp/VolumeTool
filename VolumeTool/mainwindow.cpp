@@ -436,6 +436,78 @@ void MainWindow::updateControlLockState()
     syncModeHintLabel->setVisible(syncEnabled);
 }
 
+bool MainWindow::getDefaultRenderEndpoint(IAudioEndpointVolume **volume, QString *deviceId)
+{
+    if (!volume) {
+        return false;
+    }
+
+    *volume = nullptr;
+
+    IMMDeviceEnumerator *enumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                  nullptr,
+                                  CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator),
+                                  reinterpret_cast<void **>(&enumerator));
+    if (FAILED(hr) || !enumerator) {
+        qWarning() << "CoCreateInstance failed while getting default endpoint:" << Qt::hex << hr;
+        return false;
+    }
+
+    IMMDevice *device = nullptr;
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    enumerator->Release();
+    if (FAILED(hr) || !device) {
+        qWarning() << "GetDefaultAudioEndpoint failed:" << Qt::hex << hr;
+        return false;
+    }
+
+    if (deviceId) {
+        LPWSTR rawDeviceId = nullptr;
+        const HRESULT idHr = device->GetId(&rawDeviceId);
+        if (SUCCEEDED(idHr) && rawDeviceId) {
+            *deviceId = QString::fromWCharArray(rawDeviceId);
+            CoTaskMemFree(rawDeviceId);
+        } else {
+            deviceId->clear();
+        }
+    }
+
+    hr = device->Activate(__uuidof(IAudioEndpointVolume),
+                          CLSCTX_ALL,
+                          nullptr,
+                          reinterpret_cast<void **>(volume));
+    device->Release();
+    if (FAILED(hr) || !*volume) {
+        qWarning() << "Activate default endpoint volume failed:" << Qt::hex << hr;
+        return false;
+    }
+
+    return true;
+}
+
+bool MainWindow::getDefaultRenderVolume(float *volumeScalar)
+{
+    if (!volumeScalar) {
+        return false;
+    }
+
+    IAudioEndpointVolume *volume = nullptr;
+    if (!getDefaultRenderEndpoint(&volume, nullptr)) {
+        return false;
+    }
+
+    const HRESULT hr = volume->GetMasterVolumeLevelScalar(volumeScalar);
+    volume->Release();
+    if (FAILED(hr)) {
+        qWarning() << "GetMasterVolumeLevelScalar failed for default endpoint:" << Qt::hex << hr;
+        return false;
+    }
+
+    return true;
+}
+
 void MainWindow::registerVolumeCallbackForCurrentDevice()
 {
     unregisterVolumeCallback();
@@ -444,14 +516,14 @@ void MainWindow::registerVolumeCallbackForCurrentDevice()
         return;
     }
 
-    const int index = deviceBox->currentIndex();
-    if (index < 0 || index >= static_cast<int>(devices.size())) {
+    QString defaultDeviceId;
+    IAudioEndpointVolume *defaultVolume = nullptr;
+    if (!getDefaultRenderEndpoint(&defaultVolume, &defaultDeviceId)) {
         return;
     }
 
     volumeCallback = new VolumeCallback(this);
-    callbackVolume = devices[index].volume;
-    callbackVolume->AddRef();
+    callbackVolume = defaultVolume;
 
     const HRESULT hr = callbackVolume->RegisterControlChangeNotify(volumeCallback);
     if (FAILED(hr)) {
@@ -480,6 +552,52 @@ void MainWindow::unregisterVolumeCallback()
     }
 }
 
+bool MainWindow::setDeviceVolumeById(const QString &deviceId, float volumeScalar)
+{
+    IMMDeviceEnumerator *enumerator = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                  nullptr,
+                                  CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator),
+                                  reinterpret_cast<void **>(&enumerator));
+    if (FAILED(hr) || !enumerator) {
+        qWarning() << "CoCreateInstance failed while setting device volume:" << Qt::hex << hr;
+        return false;
+    }
+
+    IMMDevice *device = nullptr;
+    const std::wstring wideId = deviceId.toStdWString();
+    hr = enumerator->GetDevice(wideId.c_str(), &device);
+    enumerator->Release();
+
+    if (FAILED(hr) || !device) {
+        qWarning() << "GetDevice failed for synced device:" << deviceId << Qt::hex << hr;
+        return false;
+    }
+
+    IAudioEndpointVolume *volume = nullptr;
+    hr = device->Activate(__uuidof(IAudioEndpointVolume),
+                          CLSCTX_ALL,
+                          nullptr,
+                          reinterpret_cast<void **>(&volume));
+    device->Release();
+
+    if (FAILED(hr) || !volume) {
+        qWarning() << "Activate failed for synced device:" << deviceId << Qt::hex << hr;
+        return false;
+    }
+
+    hr = volume->SetMasterVolumeLevelScalar(volumeScalar, &kVolumeSyncContext);
+    volume->Release();
+
+    if (FAILED(hr)) {
+        qWarning() << "SetMasterVolumeLevelScalar failed for synced device:" << deviceId << Qt::hex << hr;
+        return false;
+    }
+
+    return true;
+}
+
 void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
 {
     if (!syncWindowsVolumeCheck->isChecked()) {
@@ -493,17 +611,11 @@ void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
         }
 
         const QString selectedId = item->data(Qt::UserRole).toString();
-        for (auto &device : devices) {
-            if (device.id != selectedId || !device.volume) {
-                continue;
-            }
-
-            const HRESULT hr = device.volume->SetMasterVolumeLevelScalar(volumeScalar, &kVolumeSyncContext);
-            if (FAILED(hr)) {
-                qWarning() << "SetMasterVolumeLevelScalar failed for synced device:" << device.name << Qt::hex << hr;
-            }
-            break;
+        if (selectedId.isEmpty()) {
+            continue;
         }
+
+        setDeviceVolumeById(selectedId, volumeScalar);
     }
 }
 
@@ -531,6 +643,19 @@ void MainWindow::onDeviceChanged(int index)
         return;
     }
 
+    if (syncWindowsVolumeCheck->isChecked()) {
+        float defaultVolumeScalar = 0.0f;
+        if (getDefaultRenderVolume(&defaultVolumeScalar)) {
+            slider->setEnabled(true);
+            slider->blockSignals(true);
+            slider->setValue(qRound(defaultVolumeScalar * 100.0f));
+            slider->blockSignals(false);
+        }
+
+        registerVolumeCallbackForCurrentDevice();
+        return;
+    }
+
     // 切换设备时，把系统当前音量同步到滑条位置。
     float volumeScalar = 0.0f;
     const HRESULT hr = devices[index].volume->GetMasterVolumeLevelScalar(&volumeScalar);
@@ -550,22 +675,32 @@ void MainWindow::onDeviceChanged(int index)
 
 void MainWindow::onSliderChanged(int value)
 {
+    // Qt 的 0-100 范围转换成 Core Audio 的 0.0-1.0 标量。
+    const float volumeScalar = static_cast<float>(value) / 100.0f;
+    if (syncWindowsVolumeCheck->isChecked()) {
+        IAudioEndpointVolume *defaultVolume = nullptr;
+        if (getDefaultRenderEndpoint(&defaultVolume, nullptr)) {
+            const HRESULT hr = defaultVolume->SetMasterVolumeLevelScalar(volumeScalar, &kVolumeSyncContext);
+            defaultVolume->Release();
+            if (FAILED(hr)) {
+                qWarning() << "SetMasterVolumeLevelScalar failed for default endpoint:" << Qt::hex << hr;
+            }
+        }
+
+        if (!internalVolumeChange) {
+            applyVolumeToSelectedDevices(volumeScalar);
+        }
+        return;
+    }
+
     const int index = deviceBox->currentIndex();
     if (index < 0 || index >= static_cast<int>(devices.size())) {
         return;
     }
 
-    // Qt 的 0-100 范围转换成 Core Audio 的 0.0-1.0 标量。
-    const float volumeScalar = static_cast<float>(value) / 100.0f;
-    const GUID *eventContext = syncWindowsVolumeCheck->isChecked() ? &kVolumeSyncContext : nullptr;
-
-    const HRESULT hr = devices[index].volume->SetMasterVolumeLevelScalar(volumeScalar, eventContext);
+    const HRESULT hr = devices[index].volume->SetMasterVolumeLevelScalar(volumeScalar, nullptr);
     if (FAILED(hr)) {
         qWarning() << "SetMasterVolumeLevelScalar failed:" << Qt::hex << hr;
-    }
-
-    if (!internalVolumeChange) {
-        applyVolumeToSelectedDevices(volumeScalar);
     }
 }
 
@@ -589,7 +724,18 @@ void MainWindow::onSyncWindowsVolumeToggled(bool checked)
     syncDeviceHintLabel->setEnabled(checked);
     syncDeviceList->setEnabled(checked);
     updateControlLockState();
-    registerVolumeCallbackForCurrentDevice();
+    if (checked) {
+        float defaultVolumeScalar = 0.0f;
+        if (getDefaultRenderVolume(&defaultVolumeScalar)) {
+            slider->blockSignals(true);
+            slider->setValue(qRound(defaultVolumeScalar * 100.0f));
+            slider->blockSignals(false);
+        }
+        registerVolumeCallbackForCurrentDevice();
+    } else {
+        unregisterVolumeCallback();
+        onDeviceChanged(deviceBox->currentIndex());
+    }
 }
 
 void MainWindow::onAutoStartToggled(bool checked)
