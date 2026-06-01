@@ -7,6 +7,8 @@ qt_standard_project_setup()
 
 qt_add_executable(VolumeTool
     WIN32 MACOSX_BUNDLE
+    audiodevicemanager.cpp
+    audiodevicemanager.h
     main.cpp
     mainwindow.cpp
     mainwindow.h

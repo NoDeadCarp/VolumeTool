@@ -1,16 +1,12 @@
 #include "MainWindow.h"
 
 #include <QCoreApplication>
-#include <QDebug>
 #include <QGroupBox>
 #include <QListWidgetItem>
 #include <QMetaObject>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QVBoxLayout>
-
-#include <functiondiscoverykeys_devpkey.h>
-#include <propvarutil.h>
 
 namespace {
 
@@ -28,10 +24,12 @@ VolumeCallback::VolumeCallback(MainWindow *owner)
 
 HRESULT STDMETHODCALLTYPE VolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA notifyData)
 {
+    // Windows 默认设备音量变化后，从这里把事件转发回主窗口。
     if (!owner || !notifyData) {
         return E_POINTER;
     }
 
+    // 忽略由软件自己触发的音量回调，避免循环联动。
     if (IsEqualGUID(notifyData->guidEventContext, kVolumeSyncContext)) {
         return S_OK;
     }
@@ -48,6 +46,7 @@ HRESULT STDMETHODCALLTYPE VolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DA
 
 HRESULT STDMETHODCALLTYPE VolumeCallback::QueryInterface(REFIID iid, VOID **object)
 {
+    // 标准 COM 接口查询实现。
     if (!object) {
         return E_POINTER;
     }
@@ -64,11 +63,13 @@ HRESULT STDMETHODCALLTYPE VolumeCallback::QueryInterface(REFIID iid, VOID **obje
 
 ULONG STDMETHODCALLTYPE VolumeCallback::AddRef()
 {
+    // 增加回调对象生命周期引用。
     return ++refCount;
 }
 
 ULONG STDMETHODCALLTYPE VolumeCallback::Release()
 {
+    // 归还引用并在计数归零时删除对象。
     const ULONG count = --refCount;
     if (count == 0) {
         delete this;
@@ -92,6 +93,7 @@ MainWindow::MainWindow(QWidget *parent)
       syncDeviceHintLabel(new QLabel(QStringLiteral("勾选后可选择需要跟随软件一起同步的设备。"), this)),
       syncDeviceList(new QListWidget(this))
 {
+    // 构造阶段只做三件事：搭 UI、准备音频环境、绑定交互。
     setupUi();
     initAudio();
     loadSettings();
@@ -112,6 +114,7 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    // 退出前先撤掉回调，再释放设备资源。
     unregisterVolumeCallback();
     clearDevices();
 
@@ -122,8 +125,10 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
+    // 控制页负责即时操作，设置页负责同步和行为选项。
     auto *controlLayout = new QVBoxLayout(controlPage);
     slider->setRange(0, 100);
+
     syncModeHintLabel->setWordWrap(true);
     syncModeHintLabel->setStyleSheet(QStringLiteral("color: #b45309;"));
     syncModeHintLabel->hide();
@@ -165,36 +170,33 @@ void MainWindow::setupUi()
 
 void MainWindow::initAudio()
 {
-    // Core Audio 基于 COM，先初始化当前线程环境。
+    // Core Audio 基于 COM，窗口线程先初始化 COM 环境。
     const HRESULT hr = CoInitialize(nullptr);
     if (SUCCEEDED(hr)) {
         comInitialized = true;
-    } else if (hr != RPC_E_CHANGED_MODE) {
-        qWarning() << "CoInitialize failed:" << Qt::hex << hr;
     }
 }
 
 void MainWindow::loadSettings()
 {
+    // 目前只有开机自启需要在启动时回显到界面。
     QSettings runSettings(QString::fromWCharArray(kAutoStartRegistryPath), QSettings::NativeFormat);
-    const QString key = applicationDisplayName();
 
+    // 这里只回显勾选状态，不在初始化阶段再次写注册表。
     QSignalBlocker blocker(autoStartCheck);
-    autoStartCheck->setChecked(runSettings.contains(key));
+    autoStartCheck->setChecked(runSettings.contains(applicationDisplayName()));
 }
 
 QString MainWindow::applicationDisplayName() const
 {
+    // 统一软件名称，避免注册表键名和显示名称不一致。
     const QString explicitName = QCoreApplication::applicationName().trimmed();
-    if (!explicitName.isEmpty()) {
-        return explicitName;
-    }
-
-    return QStringLiteral("VolumeTool");
+    return explicitName.isEmpty() ? QStringLiteral("VolumeTool") : explicitName;
 }
 
 void MainWindow::updateAutoStart(bool enabled)
 {
+    // 开机自启通过当前用户 Run 注册表项控制。
     QSettings runSettings(QString::fromWCharArray(kAutoStartRegistryPath), QSettings::NativeFormat);
     const QString key = applicationDisplayName();
 
@@ -208,134 +210,32 @@ void MainWindow::updateAutoStart(bool enabled)
 
 void MainWindow::clearDevices()
 {
-    // 刷新设备列表前，先释放旧的 COM 接口，避免句柄泄漏。
-    for (auto &d : devices) {
-        if (d.volume) {
-            d.volume->Release();
-        }
-        if (d.device) {
-            d.device->Release();
-        }
-    }
-    devices.clear();
+    // 设备接口由 AudioDeviceManager 统一释放，避免窗口层手动漏掉。
+    audioDeviceManager.releaseDevices(devices);
 }
 
 void MainWindow::refreshDevices(bool showVirtual)
 {
+    // 控制页设备列表刷新时，同时带动设置页同步列表更新。
     unregisterVolumeCallback();
     clearDevices();
 
-    // 清空下拉框时临时屏蔽信号，避免触发无效的设备切换。
+    // 清空下拉框时临时屏蔽信号，避免触发无效设备切换。
     deviceBox->blockSignals(true);
     deviceBox->clear();
     deviceBox->blockSignals(false);
 
-    IMMDeviceEnumerator *enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
-                                  nullptr,
-                                  CLSCTX_ALL,
-                                  __uuidof(IMMDeviceEnumerator),
-                                  reinterpret_cast<void **>(&enumerator));
-    if (FAILED(hr) || !enumerator) {
-        qWarning() << "CoCreateInstance failed:" << Qt::hex << hr;
-        updateSyncDeviceList();
-        return;
+    devices = audioDeviceManager.loadRenderDevices(showVirtual);
+    for (const auto &device : devices) {
+        deviceBox->addItem(device.name);
     }
 
-    IMMDeviceCollection *collection = nullptr;
-    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
-    if (FAILED(hr) || !collection) {
-        qWarning() << "EnumAudioEndpoints failed:" << Qt::hex << hr;
-        enumerator->Release();
-        updateSyncDeviceList();
-        return;
-    }
-
-    UINT count = 0;
-    hr = collection->GetCount(&count);
-    if (FAILED(hr)) {
-        qWarning() << "GetCount failed:" << Qt::hex << hr;
-        collection->Release();
-        enumerator->Release();
-        updateSyncDeviceList();
-        return;
-    }
-
-    for (UINT i = 0; i < count; ++i) {
-        IMMDevice *device = nullptr;
-        hr = collection->Item(i, &device);
-        if (FAILED(hr) || !device) {
-            continue;
-        }
-
-        // 根据名称和实例 ID 过滤常见虚拟输出设备。
-        const bool virtualDevice = isVirtualDevice(device);
-        if (!showVirtual && virtualDevice) {
-            device->Release();
-            continue;
-        }
-
-        IPropertyStore *props = nullptr;
-        hr = device->OpenPropertyStore(STGM_READ, &props);
-        if (FAILED(hr) || !props) {
-            device->Release();
-            continue;
-        }
-
-        PROPVARIANT varName;
-        PropVariantInit(&varName);
-
-        const HRESULT nameHr = props->GetValue(PKEY_Device_FriendlyName, &varName);
-        if (FAILED(nameHr) || varName.vt != VT_LPWSTR || !varName.pwszVal) {
-            PropVariantClear(&varName);
-            props->Release();
-            device->Release();
-            continue;
-        }
-
-        LPWSTR rawDeviceId = nullptr;
-        const HRESULT idHr = device->GetId(&rawDeviceId);
-        if (FAILED(idHr) || !rawDeviceId) {
-            PropVariantClear(&varName);
-            props->Release();
-            device->Release();
-            continue;
-        }
-
-        IAudioEndpointVolume *volume = nullptr;
-        hr = device->Activate(__uuidof(IAudioEndpointVolume),
-                              CLSCTX_ALL,
-                              nullptr,
-                              reinterpret_cast<void **>(&volume));
-        if (FAILED(hr) || !volume) {
-            PropVariantClear(&varName);
-            CoTaskMemFree(rawDeviceId);
-            props->Release();
-            device->Release();
-            continue;
-        }
-
-        DeviceItem item;
-        item.id = QString::fromWCharArray(rawDeviceId);
-        item.name = QString::fromWCharArray(varName.pwszVal);
-        item.device = device;
-        item.volume = volume;
-
-        devices.push_back(item);
-        deviceBox->addItem(item.name);
-
-        PropVariantClear(&varName);
-        CoTaskMemFree(rawDeviceId);
-        props->Release();
-    }
-
-    collection->Release();
-    enumerator->Release();
     updateSyncDeviceList();
 }
 
 void MainWindow::updateSyncDeviceList()
 {
+    // 设置页始终显示全部设备，并尽量保留用户已有勾选。
     const QStringList previouslyChecked = [&]() {
         QStringList checkedIds;
         for (int i = 0; i < syncDeviceList->count(); ++i) {
@@ -349,80 +249,15 @@ void MainWindow::updateSyncDeviceList()
 
     syncDeviceList->clear();
 
-    IMMDeviceEnumerator *enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
-                                  nullptr,
-                                  CLSCTX_ALL,
-                                  __uuidof(IMMDeviceEnumerator),
-                                  reinterpret_cast<void **>(&enumerator));
-    if (FAILED(hr) || !enumerator) {
-        auto *item = new QListWidgetItem(QStringLiteral("无法读取设备列表"), syncDeviceList);
-        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
-        return;
+    const auto snapshots = audioDeviceManager.loadAllRenderDeviceSnapshots();
+    for (const auto &snapshot : snapshots) {
+        auto *item = new QListWidgetItem(snapshot.name, syncDeviceList);
+        item->setData(Qt::UserRole, snapshot.id);
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setCheckState(previouslyChecked.contains(snapshot.id) ? Qt::Checked : Qt::Unchecked);
     }
 
-    IMMDeviceCollection *collection = nullptr;
-    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
-    if (FAILED(hr) || !collection) {
-        enumerator->Release();
-        auto *item = new QListWidgetItem(QStringLiteral("无法读取设备列表"), syncDeviceList);
-        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
-        return;
-    }
-
-    UINT count = 0;
-    hr = collection->GetCount(&count);
-    if (FAILED(hr)) {
-        collection->Release();
-        enumerator->Release();
-        auto *item = new QListWidgetItem(QStringLiteral("无法读取设备列表"), syncDeviceList);
-        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
-        return;
-    }
-
-    for (UINT i = 0; i < count; ++i) {
-        IMMDevice *device = nullptr;
-        hr = collection->Item(i, &device);
-        if (FAILED(hr) || !device) {
-            continue;
-        }
-
-        IPropertyStore *props = nullptr;
-        hr = device->OpenPropertyStore(STGM_READ, &props);
-        if (FAILED(hr) || !props) {
-            device->Release();
-            continue;
-        }
-
-        PROPVARIANT varName;
-        PropVariantInit(&varName);
-        const HRESULT nameHr = props->GetValue(PKEY_Device_FriendlyName, &varName);
-
-        LPWSTR rawDeviceId = nullptr;
-        const HRESULT idHr = device->GetId(&rawDeviceId);
-
-        if (SUCCEEDED(nameHr) && varName.vt == VT_LPWSTR && varName.pwszVal
-            && SUCCEEDED(idHr) && rawDeviceId) {
-            auto *item = new QListWidgetItem(QString::fromWCharArray(varName.pwszVal), syncDeviceList);
-            item->setData(Qt::UserRole, QString::fromWCharArray(rawDeviceId));
-            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-            item->setCheckState(previouslyChecked.contains(item->data(Qt::UserRole).toString())
-                                    ? Qt::Checked
-                                    : Qt::Unchecked);
-        }
-
-        if (rawDeviceId) {
-            CoTaskMemFree(rawDeviceId);
-        }
-        PropVariantClear(&varName);
-        props->Release();
-        device->Release();
-    }
-
-    collection->Release();
-    enumerator->Release();
-
-    if (syncDeviceList->count() == 0) {
+    if (snapshots.empty()) {
         auto *item = new QListWidgetItem(QStringLiteral("当前没有可供选择的输出设备"), syncDeviceList);
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
     }
@@ -430,95 +265,25 @@ void MainWindow::updateSyncDeviceList()
 
 void MainWindow::updateControlLockState()
 {
+    // 同步模式开启后，控制页设备选择改为只读。
     const bool syncEnabled = syncWindowsVolumeCheck->isChecked();
     deviceBox->setEnabled(!syncEnabled);
     showVirtualCheck->setEnabled(!syncEnabled);
     syncModeHintLabel->setVisible(syncEnabled);
 }
 
-bool MainWindow::getDefaultRenderEndpoint(IAudioEndpointVolume **volume, QString *deviceId)
-{
-    if (!volume) {
-        return false;
-    }
-
-    *volume = nullptr;
-
-    IMMDeviceEnumerator *enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
-                                  nullptr,
-                                  CLSCTX_ALL,
-                                  __uuidof(IMMDeviceEnumerator),
-                                  reinterpret_cast<void **>(&enumerator));
-    if (FAILED(hr) || !enumerator) {
-        qWarning() << "CoCreateInstance failed while getting default endpoint:" << Qt::hex << hr;
-        return false;
-    }
-
-    IMMDevice *device = nullptr;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    enumerator->Release();
-    if (FAILED(hr) || !device) {
-        qWarning() << "GetDefaultAudioEndpoint failed:" << Qt::hex << hr;
-        return false;
-    }
-
-    if (deviceId) {
-        LPWSTR rawDeviceId = nullptr;
-        const HRESULT idHr = device->GetId(&rawDeviceId);
-        if (SUCCEEDED(idHr) && rawDeviceId) {
-            *deviceId = QString::fromWCharArray(rawDeviceId);
-            CoTaskMemFree(rawDeviceId);
-        } else {
-            deviceId->clear();
-        }
-    }
-
-    hr = device->Activate(__uuidof(IAudioEndpointVolume),
-                          CLSCTX_ALL,
-                          nullptr,
-                          reinterpret_cast<void **>(volume));
-    device->Release();
-    if (FAILED(hr) || !*volume) {
-        qWarning() << "Activate default endpoint volume failed:" << Qt::hex << hr;
-        return false;
-    }
-
-    return true;
-}
-
-bool MainWindow::getDefaultRenderVolume(float *volumeScalar)
-{
-    if (!volumeScalar) {
-        return false;
-    }
-
-    IAudioEndpointVolume *volume = nullptr;
-    if (!getDefaultRenderEndpoint(&volume, nullptr)) {
-        return false;
-    }
-
-    const HRESULT hr = volume->GetMasterVolumeLevelScalar(volumeScalar);
-    volume->Release();
-    if (FAILED(hr)) {
-        qWarning() << "GetMasterVolumeLevelScalar failed for default endpoint:" << Qt::hex << hr;
-        return false;
-    }
-
-    return true;
-}
-
 void MainWindow::registerVolumeCallbackForCurrentDevice()
 {
+    // 同步模式下只监听 Windows 默认设备，保证和系统音量条一致。
     unregisterVolumeCallback();
 
     if (!syncWindowsVolumeCheck->isChecked()) {
         return;
     }
 
-    QString defaultDeviceId;
+    // 同步模式监听的是 Windows 默认输出设备，而不是控制页下拉框当前项。
     IAudioEndpointVolume *defaultVolume = nullptr;
-    if (!getDefaultRenderEndpoint(&defaultVolume, &defaultDeviceId)) {
+    if (!audioDeviceManager.getDefaultRenderEndpoint(&defaultVolume, nullptr)) {
         return;
     }
 
@@ -527,7 +292,6 @@ void MainWindow::registerVolumeCallbackForCurrentDevice()
 
     const HRESULT hr = callbackVolume->RegisterControlChangeNotify(volumeCallback);
     if (FAILED(hr)) {
-        qWarning() << "RegisterControlChangeNotify failed:" << Qt::hex << hr;
         callbackVolume->Release();
         callbackVolume = nullptr;
         volumeCallback->Release();
@@ -537,6 +301,7 @@ void MainWindow::registerVolumeCallbackForCurrentDevice()
 
 void MainWindow::unregisterVolumeCallback()
 {
+    // 切换模式或退出时，要把默认设备回调干净撤掉。
     if (callbackVolume && volumeCallback) {
         callbackVolume->UnregisterControlChangeNotify(volumeCallback);
     }
@@ -552,58 +317,14 @@ void MainWindow::unregisterVolumeCallback()
     }
 }
 
-bool MainWindow::setDeviceVolumeById(const QString &deviceId, float volumeScalar)
-{
-    IMMDeviceEnumerator *enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
-                                  nullptr,
-                                  CLSCTX_ALL,
-                                  __uuidof(IMMDeviceEnumerator),
-                                  reinterpret_cast<void **>(&enumerator));
-    if (FAILED(hr) || !enumerator) {
-        qWarning() << "CoCreateInstance failed while setting device volume:" << Qt::hex << hr;
-        return false;
-    }
-
-    IMMDevice *device = nullptr;
-    const std::wstring wideId = deviceId.toStdWString();
-    hr = enumerator->GetDevice(wideId.c_str(), &device);
-    enumerator->Release();
-
-    if (FAILED(hr) || !device) {
-        qWarning() << "GetDevice failed for synced device:" << deviceId << Qt::hex << hr;
-        return false;
-    }
-
-    IAudioEndpointVolume *volume = nullptr;
-    hr = device->Activate(__uuidof(IAudioEndpointVolume),
-                          CLSCTX_ALL,
-                          nullptr,
-                          reinterpret_cast<void **>(&volume));
-    device->Release();
-
-    if (FAILED(hr) || !volume) {
-        qWarning() << "Activate failed for synced device:" << deviceId << Qt::hex << hr;
-        return false;
-    }
-
-    hr = volume->SetMasterVolumeLevelScalar(volumeScalar, &kVolumeSyncContext);
-    volume->Release();
-
-    if (FAILED(hr)) {
-        qWarning() << "SetMasterVolumeLevelScalar failed for synced device:" << deviceId << Qt::hex << hr;
-        return false;
-    }
-
-    return true;
-}
-
 void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
 {
+    // 把统一后的目标音量广播给设置页勾选的每个设备。
     if (!syncWindowsVolumeCheck->isChecked()) {
         return;
     }
 
+    // 同步模式下只根据设置页勾选结果广播，不依赖控制页筛选状态。
     for (int i = 0; i < syncDeviceList->count(); ++i) {
         QListWidgetItem *item = syncDeviceList->item(i);
         if (!item || item->checkState() != Qt::Checked) {
@@ -611,20 +332,20 @@ void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
         }
 
         const QString selectedId = item->data(Qt::UserRole).toString();
-        if (selectedId.isEmpty()) {
-            continue;
+        if (!selectedId.isEmpty()) {
+            audioDeviceManager.setDeviceVolumeById(selectedId, volumeScalar, &kVolumeSyncContext);
         }
-
-        setDeviceVolumeById(selectedId, volumeScalar);
     }
 }
 
 void MainWindow::handleExternalVolumeChange(float volumeScalar)
 {
+    // 这是 Windows 音量条变动进入软件后的统一入口。
     if (!syncWindowsVolumeCheck->isChecked()) {
         return;
     }
 
+    // Windows 侧音量变化时，先刷新滑条，再同步到勾选设备。
     internalVolumeChange = true;
     slider->setValue(qRound(volumeScalar * 100.0f));
     internalVolumeChange = false;
@@ -634,6 +355,7 @@ void MainWindow::handleExternalVolumeChange(float volumeScalar)
 
 void MainWindow::onDeviceChanged(int index)
 {
+    // 非同步模式下跟随当前设备，同步模式下跟随 Windows 默认音量。
     if (index < 0 || index >= static_cast<int>(devices.size())) {
         slider->blockSignals(true);
         slider->setValue(0);
@@ -645,7 +367,7 @@ void MainWindow::onDeviceChanged(int index)
 
     if (syncWindowsVolumeCheck->isChecked()) {
         float defaultVolumeScalar = 0.0f;
-        if (getDefaultRenderVolume(&defaultVolumeScalar)) {
+        if (audioDeviceManager.getDefaultRenderVolume(&defaultVolumeScalar)) {
             slider->setEnabled(true);
             slider->blockSignals(true);
             slider->setValue(qRound(defaultVolumeScalar * 100.0f));
@@ -656,12 +378,8 @@ void MainWindow::onDeviceChanged(int index)
         return;
     }
 
-    // 切换设备时，把系统当前音量同步到滑条位置。
     float volumeScalar = 0.0f;
-    const HRESULT hr = devices[index].volume->GetMasterVolumeLevelScalar(&volumeScalar);
-    if (FAILED(hr)) {
-        qWarning() << "GetMasterVolumeLevelScalar failed:" << Qt::hex << hr;
-        unregisterVolumeCallback();
+    if (!audioDeviceManager.readDeviceVolume(devices[index].volume, &volumeScalar)) {
         return;
     }
 
@@ -669,22 +387,18 @@ void MainWindow::onDeviceChanged(int index)
     slider->blockSignals(true);
     slider->setValue(qRound(volumeScalar * 100.0f));
     slider->blockSignals(false);
-
-    registerVolumeCallbackForCurrentDevice();
 }
 
 void MainWindow::onSliderChanged(int value)
 {
-    // Qt 的 0-100 范围转换成 Core Audio 的 0.0-1.0 标量。
+    // 滑条是软件唯一的音量输入源，模式不同会走不同控制路径。
     const float volumeScalar = static_cast<float>(value) / 100.0f;
+
     if (syncWindowsVolumeCheck->isChecked()) {
         IAudioEndpointVolume *defaultVolume = nullptr;
-        if (getDefaultRenderEndpoint(&defaultVolume, nullptr)) {
-            const HRESULT hr = defaultVolume->SetMasterVolumeLevelScalar(volumeScalar, &kVolumeSyncContext);
+        if (audioDeviceManager.getDefaultRenderEndpoint(&defaultVolume, nullptr)) {
+            audioDeviceManager.setDeviceVolume(defaultVolume, volumeScalar, &kVolumeSyncContext);
             defaultVolume->Release();
-            if (FAILED(hr)) {
-                qWarning() << "SetMasterVolumeLevelScalar failed for default endpoint:" << Qt::hex << hr;
-            }
         }
 
         if (!internalVolumeChange) {
@@ -698,14 +412,12 @@ void MainWindow::onSliderChanged(int value)
         return;
     }
 
-    const HRESULT hr = devices[index].volume->SetMasterVolumeLevelScalar(volumeScalar, nullptr);
-    if (FAILED(hr)) {
-        qWarning() << "SetMasterVolumeLevelScalar failed:" << Qt::hex << hr;
-    }
+    audioDeviceManager.setDeviceVolume(devices[index].volume, volumeScalar, nullptr);
 }
 
 void MainWindow::loadDevices(bool showVirtual)
 {
+    // 重新加载控制页设备，并把滑条同步到新的首项或默认状态。
     refreshDevices(showVirtual);
     updateControlLockState();
 
@@ -714,19 +426,20 @@ void MainWindow::loadDevices(bool showVirtual)
         return;
     }
 
-    // 设备刷新后默认选中第一项，并立即同步它的音量。
     deviceBox->setCurrentIndex(0);
     onDeviceChanged(0);
 }
 
 void MainWindow::onSyncWindowsVolumeToggled(bool checked)
 {
+    // 切换同步模式时，要同时更新 UI 锁定和回调监听关系。
     syncDeviceHintLabel->setEnabled(checked);
     syncDeviceList->setEnabled(checked);
     updateControlLockState();
+
     if (checked) {
         float defaultVolumeScalar = 0.0f;
-        if (getDefaultRenderVolume(&defaultVolumeScalar)) {
+        if (audioDeviceManager.getDefaultRenderVolume(&defaultVolumeScalar)) {
             slider->blockSignals(true);
             slider->setValue(qRound(defaultVolumeScalar * 100.0f));
             slider->blockSignals(false);
@@ -740,41 +453,6 @@ void MainWindow::onSyncWindowsVolumeToggled(bool checked)
 
 void MainWindow::onAutoStartToggled(bool checked)
 {
+    // 用户勾选变化后立刻写回系统设置。
     updateAutoStart(checked);
-}
-
-bool MainWindow::isVirtualDevice(IMMDevice *device)
-{
-    IPropertyStore *props = nullptr;
-    const HRESULT hr = device->OpenPropertyStore(STGM_READ, &props);
-    if (FAILED(hr) || !props) {
-        return false;
-    }
-
-    PROPVARIANT varName;
-    PropVariantInit(&varName);
-
-    const HRESULT nameHr = props->GetValue(PKEY_Device_FriendlyName, &varName);
-
-    const QString name = (SUCCEEDED(nameHr) && varName.vt == VT_LPWSTR && varName.pwszVal)
-        ? QString::fromWCharArray(varName.pwszVal)
-        : QString();
-
-    LPWSTR rawDeviceId = nullptr;
-    const HRESULT idHr = device->GetId(&rawDeviceId);
-    const QString id = (SUCCEEDED(idHr) && rawDeviceId)
-        ? QString::fromWCharArray(rawDeviceId)
-        : QString();
-
-    props->Release();
-    PropVariantClear(&varName);
-    if (rawDeviceId) {
-        CoTaskMemFree(rawDeviceId);
-    }
-
-    return name.contains("Virtual", Qt::CaseInsensitive)
-        || name.contains("VB-Audio", Qt::CaseInsensitive)
-        || name.contains("Voicemeeter", Qt::CaseInsensitive)
-        || id.startsWith("ROOT\\")
-        || id.contains("SWD\\");
 }
