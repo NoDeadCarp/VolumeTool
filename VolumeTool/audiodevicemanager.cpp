@@ -27,6 +27,12 @@ IMMDeviceEnumerator *AudioDeviceManager::createEnumerator() const
     return enumerator;
 }
 
+IMMDeviceEnumerator *AudioDeviceManager::createNotificationEnumerator() const
+{
+    // 设备变化通知和设备枚举共用同一类枚举器，这里单独暴露给窗口层注册通知。
+    return createEnumerator();
+}
+
 QString AudioDeviceManager::readDeviceName(IMMDevice *device) const
 {
     // 控制页和设置页都用系统友好名称展示设备。

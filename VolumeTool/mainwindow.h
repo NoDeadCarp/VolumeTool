@@ -7,12 +7,14 @@
 #include <QMainWindow>
 #include <QSlider>
 #include <QTabWidget>
+#include <QTimer>
 #include <QWidget>
 
 #include <atomic>
 #include <vector>
 
 #include <endpointvolume.h>
+#include <mmdeviceapi.h>
 
 #include "audiodevicemanager.h"
 
@@ -38,6 +40,37 @@ private:
     MainWindow *owner;
 };
 
+class DeviceNotificationCallback : public IMMNotificationClient
+{
+public:
+    // 保存主窗口指针，设备变化时回调到界面层。
+    explicit DeviceNotificationCallback(MainWindow *owner);
+
+    // 默认播放设备变化时触发。
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDeviceId) override;
+    // 新设备加入时触发。
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR pwstrDeviceId) override;
+    // 设备移除时触发。
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR pwstrDeviceId) override;
+    // 设备状态变化时触发。
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState) override;
+    // 设备属性变化时触发。
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR pwstrDeviceId, const PROPERTYKEY key) override;
+    // COM 接口查询入口。
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, VOID **object) override;
+    // 增加 COM 回调对象引用计数。
+    ULONG STDMETHODCALLTYPE AddRef() override;
+    // 释放 COM 回调对象引用计数。
+    ULONG STDMETHODCALLTYPE Release() override;
+
+private:
+    // 把系统设备变化事件合并后转发给主窗口刷新。
+    void scheduleRefresh();
+
+    std::atomic<ULONG> refCount{1};
+    MainWindow *owner;
+};
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -50,6 +83,8 @@ public:
 
     // 处理来自 Windows 默认音量回调的外部音量变化。
     void handleExternalVolumeChange(float volumeScalar);
+    // 处理来自系统设备通知的列表刷新请求。
+    void handleDeviceListChanged();
 
 private:
     QTabWidget *tabWidget;
@@ -72,6 +107,9 @@ private:
     bool internalVolumeChange = false;
     VolumeCallback *volumeCallback = nullptr;
     IAudioEndpointVolume *callbackVolume = nullptr;
+    DeviceNotificationCallback *deviceNotificationCallback = nullptr;
+    IMMDeviceEnumerator *notificationEnumerator = nullptr;
+    QTimer *deviceRefreshTimer = nullptr;
 
     // 控制页当前可直接操作的设备列表。
     std::vector<AudioDeviceEntry> devices;
@@ -97,6 +135,10 @@ private:
     void registerVolumeCallbackForCurrentDevice();
     // 取消当前注册的系统音量回调。
     void unregisterVolumeCallback();
+    // 注册系统音频设备变更通知。
+    void registerDeviceNotifications();
+    // 取消系统音频设备变更通知。
+    void unregisterDeviceNotifications();
     // 将一个音量值广播到设置页勾选的所有设备。
     void applyVolumeToSelectedDevices(float volumeScalar);
     // 返回软件在注册表里使用的显示名称。

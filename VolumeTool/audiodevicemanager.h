@@ -41,6 +41,8 @@ public:
     bool setDeviceVolume(IAudioEndpointVolume *volume, float volumeScalar, const GUID *eventContext = nullptr) const;
     // 通过设备 ID 重新定位设备并设置音量。
     bool setDeviceVolumeById(const QString &deviceId, float volumeScalar, const GUID *eventContext = nullptr) const;
+    // 创建用于监听系统音频设备变化的枚举器。
+    IMMDeviceEnumerator *createNotificationEnumerator() const;
 
 private:
     // 创建 Core Audio 设备枚举器。

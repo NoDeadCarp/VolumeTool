@@ -17,6 +17,95 @@ const GUID kVolumeSyncContext = {
 
 }
 
+DeviceNotificationCallback::DeviceNotificationCallback(MainWindow *owner)
+    : owner(owner)
+{
+}
+
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR)
+{
+    // 默认播放设备切换后，控制页和同步逻辑都需要刷新。
+    if (flow == eRender && role == eConsole) {
+        scheduleRefresh();
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceAdded(LPCWSTR)
+{
+    // 插入新设备后刷新列表。
+    scheduleRefresh();
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceRemoved(LPCWSTR)
+{
+    // 设备移除后刷新列表。
+    scheduleRefresh();
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceStateChanged(LPCWSTR, DWORD)
+{
+    // 启用/禁用等状态变化也会影响展示结果。
+    scheduleRefresh();
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY)
+{
+    // 名称等属性变化后同步更新界面显示。
+    scheduleRefresh();
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::QueryInterface(REFIID iid, VOID **object)
+{
+    // 标准 COM 接口查询实现。
+    if (!object) {
+        return E_POINTER;
+    }
+
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IMMNotificationClient)) {
+        *object = static_cast<IMMNotificationClient *>(this);
+        AddRef();
+        return S_OK;
+    }
+
+    *object = nullptr;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE DeviceNotificationCallback::AddRef()
+{
+    // 增加设备通知回调对象引用。
+    return ++refCount;
+}
+
+ULONG STDMETHODCALLTYPE DeviceNotificationCallback::Release()
+{
+    // 归还引用并在归零时销毁对象。
+    const ULONG count = --refCount;
+    if (count == 0) {
+        delete this;
+    }
+    return count;
+}
+
+void DeviceNotificationCallback::scheduleRefresh()
+{
+    // 设备通知通常会连续触发，这里统一切回 UI 线程做防抖刷新。
+    if (!owner) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(owner, [this]() {
+        if (owner) {
+            owner->handleDeviceListChanged();
+        }
+    }, Qt::QueuedConnection);
+}
+
 VolumeCallback::VolumeCallback(MainWindow *owner)
     : owner(owner)
 {
@@ -91,12 +180,19 @@ MainWindow::MainWindow(QWidget *parent)
       restartAudioEngineCheck(new QCheckBox(QStringLiteral("设备变动时重启 audio engine"), this)),
       syncWindowsVolumeCheck(new QCheckBox(QStringLiteral("同步 Windows 音量滑轨"), this)),
       syncDeviceHintLabel(new QLabel(QStringLiteral("勾选后可选择需要跟随软件一起同步的设备。"), this)),
-      syncDeviceList(new QListWidget(this))
+      syncDeviceList(new QListWidget(this)),
+      deviceRefreshTimer(new QTimer(this))
 {
     // 构造阶段只做三件事：搭 UI、准备音频环境、绑定交互。
     setupUi();
     initAudio();
     loadSettings();
+
+    deviceRefreshTimer->setSingleShot(true);
+    deviceRefreshTimer->setInterval(200);
+    connect(deviceRefreshTimer, &QTimer::timeout, this, [this]() {
+        loadDevices(showVirtualCheck->isChecked());
+    });
 
     connect(deviceBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onDeviceChanged);
@@ -109,12 +205,14 @@ MainWindow::MainWindow(QWidget *parent)
     connect(autoStartCheck, &QCheckBox::toggled,
             this, &MainWindow::onAutoStartToggled);
 
+    registerDeviceNotifications();
     loadDevices(showVirtualCheck->isChecked());
 }
 
 MainWindow::~MainWindow()
 {
     // 退出前先撤掉回调，再释放设备资源。
+    unregisterDeviceNotifications();
     unregisterVolumeCallback();
     clearDevices();
 
@@ -230,6 +328,7 @@ void MainWindow::refreshDevices(bool showVirtual)
         deviceBox->addItem(device.name);
     }
 
+
     updateSyncDeviceList();
 }
 
@@ -317,6 +416,44 @@ void MainWindow::unregisterVolumeCallback()
     }
 }
 
+void MainWindow::registerDeviceNotifications()
+{
+    // 注册系统设备变更通知，让插拔设备后界面可以自动刷新。
+    unregisterDeviceNotifications();
+
+    notificationEnumerator = audioDeviceManager.createNotificationEnumerator();
+    if (!notificationEnumerator) {
+        return;
+    }
+
+    deviceNotificationCallback = new DeviceNotificationCallback(this);
+    const HRESULT hr = notificationEnumerator->RegisterEndpointNotificationCallback(deviceNotificationCallback);
+    if (FAILED(hr)) {
+        deviceNotificationCallback->Release();
+        deviceNotificationCallback = nullptr;
+        notificationEnumerator->Release();
+        notificationEnumerator = nullptr;
+    }
+}
+
+void MainWindow::unregisterDeviceNotifications()
+{
+    // 退出前或重新注册前，先把旧的设备通知回调解绑。
+    if (notificationEnumerator && deviceNotificationCallback) {
+        notificationEnumerator->UnregisterEndpointNotificationCallback(deviceNotificationCallback);
+    }
+
+    if (deviceNotificationCallback) {
+        deviceNotificationCallback->Release();
+        deviceNotificationCallback = nullptr;
+    }
+
+    if (notificationEnumerator) {
+        notificationEnumerator->Release();
+        notificationEnumerator = nullptr;
+    }
+}
+
 void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
 {
     // 把统一后的目标音量广播给设置页勾选的每个设备。
@@ -351,6 +488,14 @@ void MainWindow::handleExternalVolumeChange(float volumeScalar)
     internalVolumeChange = false;
 
     applyVolumeToSelectedDevices(volumeScalar);
+}
+
+void MainWindow::handleDeviceListChanged()
+{
+    // 多个系统通知会在短时间连续触发，这里统一交给定时器做轻量防抖刷新。
+    if (deviceRefreshTimer) {
+        deviceRefreshTimer->start();
+    }
 }
 
 void MainWindow::onDeviceChanged(int index)
