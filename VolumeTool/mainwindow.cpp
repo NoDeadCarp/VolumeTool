@@ -21,6 +21,40 @@ const GUID kVolumeSyncContext = {
     0x0fdd79ca, 0x95d0, 0x47a5, {0x97, 0x74, 0xf8, 0x41, 0x82, 0x37, 0x33, 0x9c}
 };
 
+QString deviceStateToText(DWORD state)
+{
+    switch (state) {
+    case DEVICE_STATE_ACTIVE:
+        return QStringLiteral("已启用");
+    case DEVICE_STATE_DISABLED:
+        return QStringLiteral("已禁用");
+    case DEVICE_STATE_NOTPRESENT:
+        return QStringLiteral("未连接");
+    case DEVICE_STATE_UNPLUGGED:
+        return QStringLiteral("已断开");
+    default:
+        return QStringLiteral("未知状态");
+    }
+}
+
+QString deviceDisplayText(MainWindow *owner, LPCWSTR rawDeviceId)
+{
+    if (!owner || !rawDeviceId) {
+        return QStringLiteral("未知设备");
+    }
+
+    return owner->describeDeviceForLog(QString::fromWCharArray(rawDeviceId));
+}
+
+QString deviceEventId(LPCWSTR rawDeviceId)
+{
+    if (!rawDeviceId) {
+        return QStringLiteral("unknown");
+    }
+
+    return QString::fromWCharArray(rawDeviceId);
+}
+
 }
 
 VolumeCallback::VolumeCallback(MainWindow *owner)
@@ -88,54 +122,56 @@ DeviceNotificationCallback::DeviceNotificationCallback(MainWindow *owner)
 {
 }
 
-HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR)
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR deviceId)
 {
-    // 默认输出设备切换后，刷新列表并记一条日志。
     if (flow == eRender && role == eConsole) {
         if (owner) {
-            owner->appendDeviceEventLog(QStringLiteral("默认输出设备已变动"));
+            const QString deviceText = deviceDisplayText(owner, deviceId);
+            owner->appendDeviceEventLog(QStringLiteral("default-render:%1").arg(deviceEventId(deviceId)),
+                                        QStringLiteral("默认输出设备已变动：%1").arg(deviceText));
         }
         scheduleRefresh();
     }
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceAdded(LPCWSTR)
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceAdded(LPCWSTR deviceId)
 {
-    // 新设备加入后刷新列表并记录日志。
     if (owner) {
-        owner->appendDeviceEventLog(QStringLiteral("检测到新设备加入"));
+        const QString deviceText = deviceDisplayText(owner, deviceId);
+        owner->appendDeviceEventLog(QStringLiteral("device-added:%1").arg(deviceEventId(deviceId)),
+                                    QStringLiteral("检测到新设备加入：%1").arg(deviceText));
     }
     scheduleRefresh();
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceRemoved(LPCWSTR)
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceRemoved(LPCWSTR deviceId)
 {
-    // 设备移除后刷新列表并记录日志。
     if (owner) {
-        owner->appendDeviceEventLog(QStringLiteral("检测到设备被移除"));
+        const QString deviceText = deviceDisplayText(owner, deviceId);
+        owner->appendDeviceEventLog(QStringLiteral("device-removed:%1").arg(deviceEventId(deviceId)),
+                                    QStringLiteral("检测到设备被移除：%1").arg(deviceText));
     }
     scheduleRefresh();
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceStateChanged(LPCWSTR, DWORD)
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceStateChanged(LPCWSTR deviceId, DWORD newState)
 {
-    // 启用、禁用等状态变化也会影响设备展示。
     if (owner) {
-        owner->appendDeviceEventLog(QStringLiteral("检测到设备状态变化"));
+        const QString deviceText = deviceDisplayText(owner, deviceId);
+        owner->appendDeviceEventLog(QStringLiteral("device-state:%1:%2").arg(deviceEventId(deviceId)).arg(newState),
+                                    QStringLiteral("%1 状态变为：%2").arg(deviceText, deviceStateToText(newState)));
     }
     scheduleRefresh();
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY)
+HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnPropertyValueChanged(LPCWSTR deviceId, const PROPERTYKEY key)
 {
-    // 设备属性变化后刷新列表并记录日志。
-    if (owner) {
-        owner->appendDeviceEventLog(QStringLiteral("检测到设备属性变化"));
-    }
+    Q_UNUSED(deviceId)
+    Q_UNUSED(key)
     scheduleRefresh();
     return S_OK;
 }
@@ -206,6 +242,7 @@ MainWindow::MainWindow(QWidget *parent)
       audioEngineStatusLabel(new QLabel(this)),
       audioEnginePathLabel(new QLabel(this)),
       deviceLogList(new QListWidget(this)),
+      clearDeviceLogButton(new QPushButton(QStringLiteral("清除日志"), this)),
       deviceRefreshTimer(new QTimer(this)),
       voicemeeterRestartTimer(new QTimer(this))
 {
@@ -235,6 +272,9 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onSyncWindowsVolumeToggled);
     connect(autoStartCheck, &QCheckBox::toggled,
             this, &MainWindow::onAutoStartToggled);
+    connect(clearDeviceLogButton, &QPushButton::clicked, this, [this]() {
+        clearDeviceEventLogs();
+    });
 
     registerDeviceNotifications();
     loadDevices(showVirtualCheck->isChecked());
@@ -299,6 +339,7 @@ void MainWindow::setupUi()
     auto *deviceLogLayout = new QVBoxLayout(deviceLogGroup);
     deviceLogList->setSelectionMode(QAbstractItemView::NoSelection);
     deviceLogLayout->addWidget(deviceLogList);
+    deviceLogLayout->addWidget(clearDeviceLogButton);
 
     voicemeeterLayout->addWidget(voicemeeterStatusGroup);
     voicemeeterLayout->addWidget(voicemeeterActionGroup);
@@ -680,6 +721,50 @@ void MainWindow::appendDeviceEventLog(const QString &message)
     deviceLogList->clear();
     deviceLogList->addItems(deviceEventLogs);
     deviceLogList->scrollToBottom();
+}
+
+void MainWindow::appendDeviceEventLog(const QString &eventKey, const QString &message)
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const qint64 lastTimestamp = deviceEventLogTimestamps.value(eventKey, 0);
+
+    // 系统会在极短时间内重复抛出同类事件，这里做一次轻量去重。
+    if (lastTimestamp > 0 && now - lastTimestamp < 1200) {
+        return;
+    }
+
+    deviceEventLogTimestamps.insert(eventKey, now);
+    appendDeviceEventLog(message);
+}
+
+QString MainWindow::describeDeviceForLog(const QString &deviceId) const
+{
+    // 优先显示设备友好名称；如果设备已经消失，就退回到压缩后的 ID，至少还能定位。
+    const QString name = audioDeviceManager.readDeviceNameById(deviceId).trimmed();
+    if (!name.isEmpty()) {
+        return name;
+    }
+
+    if (deviceId.isEmpty()) {
+        return QStringLiteral("未知设备");
+    }
+
+    const int tailLength = 24;
+    const QString shortId = deviceId.size() > tailLength
+        ? QStringLiteral("...%1").arg(deviceId.right(tailLength))
+        : deviceId;
+    return QStringLiteral("未知设备（%1）").arg(shortId);
+}
+
+void MainWindow::clearDeviceEventLogs()
+{
+    // 清空日志时同时重置去重时间，避免清空后新事件被旧节流状态吞掉。
+    deviceEventLogs.clear();
+    deviceEventLogTimestamps.clear();
+
+    if (deviceLogList) {
+        deviceLogList->clear();
+    }
 }
 
 void MainWindow::handleDeviceListChanged()

@@ -5,10 +5,12 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QMainWindow>
+#include <QMap>
+#include <QPushButton>
 #include <QSlider>
+#include <QStringList>
 #include <QTabWidget>
 #include <QTimer>
-#include <QStringList>
 #include <QWidget>
 
 #include <atomic>
@@ -87,6 +89,12 @@ public:
     void handleExternalVolumeChange(float volumeScalar);
     // 记录一条设备变动日志，并更新界面中的日志列表。
     void appendDeviceEventLog(const QString &message);
+    // 记录一条设备事件日志，并对短时间内的重复事件做去重。
+    void appendDeviceEventLog(const QString &eventKey, const QString &message);
+    // 根据设备 ID 生成适合日志显示的设备名称文本。
+    QString describeDeviceForLog(const QString &deviceId) const;
+    // 清空内存中的设备变动日志和去重状态。
+    void clearDeviceEventLogs();
     // 处理来自系统设备通知的列表刷新请求。
     void handleDeviceListChanged();
 
@@ -111,6 +119,7 @@ private:
     QLabel *audioEngineStatusLabel;
     QLabel *audioEnginePathLabel;
     QListWidget *deviceLogList;
+    QPushButton *clearDeviceLogButton;
 
     bool comInitialized = false;
     bool internalVolumeChange = false;
@@ -125,6 +134,8 @@ private:
     std::vector<AudioDeviceEntry> devices;
     // 设备变动日志只保留内存中的最近 100 条。
     QStringList deviceEventLogs;
+    // 记录最近一次各类设备事件的时间，用来抑制高频重复日志。
+    QMap<QString, qint64> deviceEventLogTimestamps;
     AudioDeviceManager audioDeviceManager;
 
     // 初始化窗口线程需要的 COM 环境。

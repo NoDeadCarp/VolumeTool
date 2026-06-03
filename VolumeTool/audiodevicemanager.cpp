@@ -345,3 +345,24 @@ bool AudioDeviceManager::setDeviceVolumeById(const QString &deviceId, float volu
     volume->Release();
     return ok;
 }
+
+QString AudioDeviceManager::readDeviceNameById(const QString &deviceId) const
+{
+    // 设备通知里通常只给 ID，这里按 ID 反查友好名称，方便日志直接定位到具体设备。
+    IMMDeviceEnumerator *enumerator = createEnumerator();
+    if (!enumerator) {
+        return {};
+    }
+
+    IMMDevice *device = nullptr;
+    const std::wstring wideId = deviceId.toStdWString();
+    const HRESULT hr = enumerator->GetDevice(wideId.c_str(), &device);
+    enumerator->Release();
+    if (FAILED(hr) || !device) {
+        return {};
+    }
+
+    const QString name = readDeviceName(device);
+    device->Release();
+    return name;
+}
