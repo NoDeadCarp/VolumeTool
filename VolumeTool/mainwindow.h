@@ -8,6 +8,7 @@
 #include <QSlider>
 #include <QTabWidget>
 #include <QTimer>
+#include <QStringList>
 #include <QWidget>
 
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <mmdeviceapi.h>
 
 #include "audiodevicemanager.h"
+#include "voicemeeterremoteclient.h"
 
 class MainWindow;
 
@@ -83,6 +85,8 @@ public:
 
     // 处理来自 Windows 默认音量回调的外部音量变化。
     void handleExternalVolumeChange(float volumeScalar);
+    // 记录一条设备变动日志，并更新界面中的日志列表。
+    void appendDeviceEventLog(const QString &message);
     // 处理来自系统设备通知的列表刷新请求。
     void handleDeviceListChanged();
 
@@ -90,6 +94,7 @@ private:
     QTabWidget *tabWidget;
     QWidget *controlPage;
     QWidget *settingsPage;
+    QWidget *voicemeeterPage;
 
     QComboBox *deviceBox;
     QCheckBox *showVirtualCheck;
@@ -98,10 +103,14 @@ private:
     QLabel *syncModeHintLabel;
 
     QCheckBox *autoStartCheck;
-    QCheckBox *restartAudioEngineCheck;
     QCheckBox *syncWindowsVolumeCheck;
     QLabel *syncDeviceHintLabel;
     QListWidget *syncDeviceList;
+
+    QCheckBox *restartAudioEngineCheck;
+    QLabel *audioEngineStatusLabel;
+    QLabel *audioEnginePathLabel;
+    QListWidget *deviceLogList;
 
     bool comInitialized = false;
     bool internalVolumeChange = false;
@@ -110,9 +119,12 @@ private:
     DeviceNotificationCallback *deviceNotificationCallback = nullptr;
     IMMDeviceEnumerator *notificationEnumerator = nullptr;
     QTimer *deviceRefreshTimer = nullptr;
+    QTimer *voicemeeterRestartTimer = nullptr;
 
     // 控制页当前可直接操作的设备列表。
     std::vector<AudioDeviceEntry> devices;
+    // 设备变动日志只保留内存中的最近 100 条。
+    QStringList deviceEventLogs;
     AudioDeviceManager audioDeviceManager;
 
     // 初始化窗口线程需要的 COM 环境。
@@ -127,8 +139,16 @@ private:
     void updateSyncDeviceList();
     // 根据是否开启同步模式更新控制页禁用状态。
     void updateControlLockState();
+    // 根据系统是否安装 Voicemeeter 更新重启 audio engine 选项状态。
+    void updateAudioEngineOptionState();
     // 从系统读取开机自启等初始状态。
     void loadSettings();
+    // 检测当前系统中是否安装了 Voicemeeter。
+    bool isVoicemeeterInstalled() const;
+    // 返回检测到的 Voicemeeter 安装路径，未找到时返回空字符串。
+    QString findVoicemeeterInstallPath() const;
+    // 返回 Voicemeeter Remote API 是否可用。
+    bool isVoicemeeterRemoteApiAvailable(const QString &installPath) const;
     // 写入或移除开机自启注册表项。
     void updateAutoStart(bool enabled);
     // 给 Windows 默认播放设备注册音量变化回调。
@@ -141,8 +161,14 @@ private:
     void unregisterDeviceNotifications();
     // 将一个音量值广播到设置页勾选的所有设备。
     void applyVolumeToSelectedDevices(float volumeScalar);
+    // 在设备频繁变动时合并多次请求，延迟重启 Voicemeeter audio engine。
+    void scheduleVoicemeeterRestart();
+    // 通过 Voicemeeter Remote API 真正执行 audio engine 重启。
+    void restartVoicemeeterAudioEngine();
     // 返回软件在注册表里使用的显示名称。
     QString applicationDisplayName() const;
+
+    VoicemeeterRemoteClient voicemeeterRemoteClient;
 
 private slots:
     // 控制页切换设备时刷新滑条显示。

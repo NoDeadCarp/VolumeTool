@@ -13,6 +13,8 @@ qt_add_executable(VolumeTool
     mainwindow.cpp
     mainwindow.h
     mainwindow.ui
+    voicemeeterremoteclient.cpp
+    voicemeeterremoteclient.h
 )
 
 target_link_libraries(VolumeTool
