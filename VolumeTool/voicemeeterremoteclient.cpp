@@ -11,6 +11,11 @@ using VBVMR_Login_Fn = long(__stdcall *)();
 using VBVMR_Logout_Fn = long(__stdcall *)();
 using VBVMR_RunVoicemeeter_Fn = long(__stdcall *)(long);
 using VBVMR_SetParameterFloat_Fn = long(__stdcall *)(char *, float);
+using VBVMR_IsParametersDirty_Fn = long(__stdcall *)();
+
+constexpr long kOk = 0;
+constexpr int kMaxReadyRetries = 50;
+constexpr int kReadyWaitMs = 40;
 
 }
 
@@ -61,8 +66,9 @@ bool VoicemeeterRemoteClient::restartAudioEngine(const QString &installPath, QSt
     const auto logout = reinterpret_cast<VBVMR_Logout_Fn>(GetProcAddress(module, "VBVMR_Logout"));
     const auto runVoicemeeter = reinterpret_cast<VBVMR_RunVoicemeeter_Fn>(GetProcAddress(module, "VBVMR_RunVoicemeeter"));
     const auto setParameterFloat = reinterpret_cast<VBVMR_SetParameterFloat_Fn>(GetProcAddress(module, "VBVMR_SetParameterFloat"));
+    const auto isParametersDirty = reinterpret_cast<VBVMR_IsParametersDirty_Fn>(GetProcAddress(module, "VBVMR_IsParametersDirty"));
 
-    if (!login || !logout || !runVoicemeeter || !setParameterFloat) {
+    if (!login || !logout || !runVoicemeeter || !setParameterFloat || !isParametersDirty) {
         if (errorMessage) {
             *errorMessage = QStringLiteral("Remote API DLL 缺少必要导出函数。");
         }
@@ -86,8 +92,30 @@ bool VoicemeeterRemoteClient::restartAudioEngine(const QString &installPath, QSt
         return false;
     }
 
+    // Login 成功后轮询等待 Voicemeeter 真正就绪。
+    bool ready = false;
+    for (int i = 0; i < kMaxReadyRetries; ++i) {
+        if (isParametersDirty() >= kOk) {
+            ready = true;
+            break;
+        }
+        Sleep(kReadyWaitMs);
+    }
+
+    if (!ready) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Voicemeeter 登录成功但未就绪，等待超时。");
+        }
+        logout();
+        FreeLibrary(module);
+        return false;
+    }
+
     char restartCommand[] = "Command.Restart";
     result = setParameterFloat(restartCommand, 1.0f);
+
+    // 等待一段时间让 Voicemeeter 有机会处理重启命令后再断开连接。
+    Sleep(500);
     logout();
     FreeLibrary(module);
 
