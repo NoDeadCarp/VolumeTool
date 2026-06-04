@@ -118,6 +118,7 @@ private:
     QCheckBox *restartAudioEngineCheck;
     QLabel *audioEngineStatusLabel;
     QLabel *audioEnginePathLabel;
+    QPushButton *manualRestartAudioEngineButton;
     QListWidget *deviceLogList;
     QPushButton *clearDeviceLogButton;
 
@@ -136,6 +137,8 @@ private:
     QStringList deviceEventLogs;
     // 记录最近一次各类设备事件的时间，用来抑制高频重复日志。
     QMap<QString, qint64> deviceEventLogTimestamps;
+    // 记录最近一次 Voicemeeter 重启请求时间，避免短时间重复重启。
+    qint64 lastVoicemeeterRestartRequestMs = 0;
     AudioDeviceManager audioDeviceManager;
 
     // 初始化窗口线程需要的 COM 环境。

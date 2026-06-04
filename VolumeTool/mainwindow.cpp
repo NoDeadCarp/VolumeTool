@@ -20,6 +20,8 @@ constexpr const wchar_t *kAutoStartRegistryPath = L"HKEY_CURRENT_USER\\Software\
 const GUID kVolumeSyncContext = {
     0x0fdd79ca, 0x95d0, 0x47a5, {0x97, 0x74, 0xf8, 0x41, 0x82, 0x37, 0x33, 0x9c}
 };
+constexpr qint64 kDeviceLogDedupWindowMs = 3000;
+constexpr qint64 kVoicemeeterRestartWindowMs = 8000;
 
 QString deviceStateToText(DWORD state)
 {
@@ -37,22 +39,20 @@ QString deviceStateToText(DWORD state)
     }
 }
 
-QString deviceDisplayText(MainWindow *owner, LPCWSTR rawDeviceId)
-{
-    if (!owner || !rawDeviceId) {
-        return QStringLiteral("未知设备");
-    }
-
-    return owner->describeDeviceForLog(QString::fromWCharArray(rawDeviceId));
-}
-
 QString deviceEventId(LPCWSTR rawDeviceId)
 {
     if (!rawDeviceId) {
         return QStringLiteral("unknown");
     }
-
     return QString::fromWCharArray(rawDeviceId);
+}
+
+QString deviceDisplayText(MainWindow *owner, LPCWSTR rawDeviceId)
+{
+    if (!owner || !rawDeviceId) {
+        return QStringLiteral("未知设备");
+    }
+    return owner->describeDeviceForLog(QString::fromWCharArray(rawDeviceId));
 }
 
 }
@@ -69,7 +69,7 @@ HRESULT STDMETHODCALLTYPE VolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DA
         return E_POINTER;
     }
 
-    // 忽略由软件自己发起的回调，避免循环联动。
+    // 忽略软件自己触发的回调，避免循环联动。
     if (IsEqualGUID(notifyData->guidEventContext, kVolumeSyncContext)) {
         return S_OK;
     }
@@ -86,7 +86,6 @@ HRESULT STDMETHODCALLTYPE VolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DA
 
 HRESULT STDMETHODCALLTYPE VolumeCallback::QueryInterface(REFIID iid, VOID **object)
 {
-    // 标准 COM 接口查询。
     if (!object) {
         return E_POINTER;
     }
@@ -103,13 +102,11 @@ HRESULT STDMETHODCALLTYPE VolumeCallback::QueryInterface(REFIID iid, VOID **obje
 
 ULONG STDMETHODCALLTYPE VolumeCallback::AddRef()
 {
-    // 增加回调对象引用计数。
     return ++refCount;
 }
 
 ULONG STDMETHODCALLTYPE VolumeCallback::Release()
 {
-    // 释放回调对象引用计数并在归零时销毁对象。
     const ULONG count = --refCount;
     if (count == 0) {
         delete this;
@@ -178,7 +175,6 @@ HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnPropertyValueChanged(LPC
 
 HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::QueryInterface(REFIID iid, VOID **object)
 {
-    // 标准 COM 接口查询。
     if (!object) {
         return E_POINTER;
     }
@@ -195,13 +191,11 @@ HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::QueryInterface(REFIID iid,
 
 ULONG STDMETHODCALLTYPE DeviceNotificationCallback::AddRef()
 {
-    // 增加设备通知回调对象引用计数。
     return ++refCount;
 }
 
 ULONG STDMETHODCALLTYPE DeviceNotificationCallback::Release()
 {
-    // 释放设备通知回调对象引用计数并在归零时销毁对象。
     const ULONG count = --refCount;
     if (count == 0) {
         delete this;
@@ -211,7 +205,6 @@ ULONG STDMETHODCALLTYPE DeviceNotificationCallback::Release()
 
 void DeviceNotificationCallback::scheduleRefresh()
 {
-    // 系统通常会连续发出多条通知，这里统一切回 UI 线程刷新。
     if (!owner) {
         return;
     }
@@ -241,12 +234,12 @@ MainWindow::MainWindow(QWidget *parent)
       restartAudioEngineCheck(new QCheckBox(QStringLiteral("设备变动时重启 audio engine"), this)),
       audioEngineStatusLabel(new QLabel(this)),
       audioEnginePathLabel(new QLabel(this)),
+      manualRestartAudioEngineButton(new QPushButton(QStringLiteral("手动重启 audio engine"), this)),
       deviceLogList(new QListWidget(this)),
       clearDeviceLogButton(new QPushButton(QStringLiteral("清除日志"), this)),
       deviceRefreshTimer(new QTimer(this)),
       voicemeeterRestartTimer(new QTimer(this))
 {
-    // 构造阶段完成界面、音频环境和事件绑定。
     setupUi();
     initAudio();
     loadSettings();
@@ -259,19 +252,16 @@ MainWindow::MainWindow(QWidget *parent)
 
     voicemeeterRestartTimer->setSingleShot(true);
     voicemeeterRestartTimer->setInterval(3000);
-    connect(voicemeeterRestartTimer, &QTimer::timeout,
-            this, &MainWindow::restartVoicemeeterAudioEngine);
+    connect(voicemeeterRestartTimer, &QTimer::timeout, this, &MainWindow::restartVoicemeeterAudioEngine);
 
-    connect(deviceBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &MainWindow::onDeviceChanged);
-    connect(slider, &QSlider::valueChanged,
-            this, &MainWindow::onSliderChanged);
-    connect(showVirtualCheck, &QCheckBox::toggled,
-            this, &MainWindow::loadDevices);
-    connect(syncWindowsVolumeCheck, &QCheckBox::toggled,
-            this, &MainWindow::onSyncWindowsVolumeToggled);
-    connect(autoStartCheck, &QCheckBox::toggled,
-            this, &MainWindow::onAutoStartToggled);
+    connect(deviceBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onDeviceChanged);
+    connect(slider, &QSlider::valueChanged, this, &MainWindow::onSliderChanged);
+    connect(showVirtualCheck, &QCheckBox::toggled, this, &MainWindow::loadDevices);
+    connect(syncWindowsVolumeCheck, &QCheckBox::toggled, this, &MainWindow::onSyncWindowsVolumeToggled);
+    connect(autoStartCheck, &QCheckBox::toggled, this, &MainWindow::onAutoStartToggled);
+    connect(manualRestartAudioEngineButton, &QPushButton::clicked, this, [this]() {
+        restartVoicemeeterAudioEngine();
+    });
     connect(clearDeviceLogButton, &QPushButton::clicked, this, [this]() {
         clearDeviceEventLogs();
     });
@@ -282,7 +272,6 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
-    // 退出前先解注册回调，再释放设备资源。
     unregisterDeviceNotifications();
     unregisterVolumeCallback();
     clearDevices();
@@ -294,7 +283,6 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
-    // 控制页负责即时操作，设置页负责通用设置，Voicemeeter 页负责相关状态和日志。
     auto *controlLayout = new QVBoxLayout(controlPage);
     slider->setRange(0, 100);
 
@@ -334,6 +322,7 @@ void MainWindow::setupUi()
     auto *voicemeeterActionGroup = new QGroupBox(QStringLiteral("Voicemeeter 功能"), voicemeeterPage);
     auto *voicemeeterActionLayout = new QVBoxLayout(voicemeeterActionGroup);
     voicemeeterActionLayout->addWidget(restartAudioEngineCheck);
+    voicemeeterActionLayout->addWidget(manualRestartAudioEngineButton);
 
     auto *deviceLogGroup = new QGroupBox(QStringLiteral("设备变动日志"), voicemeeterPage);
     auto *deviceLogLayout = new QVBoxLayout(deviceLogGroup);
@@ -359,7 +348,6 @@ void MainWindow::setupUi()
 
 void MainWindow::initAudio()
 {
-    // Core Audio 基于 COM，窗口线程需要先初始化 COM 环境。
     const HRESULT hr = CoInitialize(nullptr);
     if (SUCCEEDED(hr)) {
         comInitialized = true;
@@ -368,7 +356,6 @@ void MainWindow::initAudio()
 
 void MainWindow::loadSettings()
 {
-    // 启动时读取开机自启状态并同步到界面。
     QSettings runSettings(QString::fromWCharArray(kAutoStartRegistryPath), QSettings::NativeFormat);
     QSignalBlocker blocker(autoStartCheck);
     autoStartCheck->setChecked(runSettings.contains(applicationDisplayName()));
@@ -377,26 +364,22 @@ void MainWindow::loadSettings()
 
 QString MainWindow::applicationDisplayName() const
 {
-    // 统一软件名称，避免注册表键名和显示名称不一致。
     const QString explicitName = QCoreApplication::applicationName().trimmed();
     return explicitName.isEmpty() ? QStringLiteral("VolumeTool") : explicitName;
 }
 
 bool MainWindow::isVoicemeeterInstalled() const
 {
-    // 直接复用安装路径检测结果。
     return !findVoicemeeterInstallPath().isEmpty();
 }
 
 bool MainWindow::isVoicemeeterRemoteApiAvailable(const QString &installPath) const
 {
-    // 只有安装目录中存在 Remote API DLL，才允许启用相关自动化功能。
     return voicemeeterRemoteClient.isAvailable(installPath);
 }
 
 QString MainWindow::findVoicemeeterInstallPath() const
 {
-    // 优先从卸载注册表中提取真实的绝对安装目录。
     auto normalizeDirectory = [](QString candidate) -> QString {
         candidate = candidate.trimmed().remove('"');
         if (candidate.isEmpty()) {
@@ -480,25 +463,18 @@ QString MainWindow::findVoicemeeterInstallPath() const
 
 void MainWindow::updateAudioEngineOptionState()
 {
-    // 只有安装了 Voicemeeter 且 Remote API 可用，重启 audio engine 选项才有意义。
     const QString installPath = findVoicemeeterInstallPath();
     const bool installed = !installPath.isEmpty();
     const bool remoteApiAvailable = installed && isVoicemeeterRemoteApiAvailable(installPath);
 
     restartAudioEngineCheck->setEnabled(remoteApiAvailable);
-    audioEngineStatusLabel->setText(installed
-        ? QStringLiteral("已安装")
-        : QStringLiteral("未检测到安装"));
-    audioEngineStatusLabel->setStyleSheet(installed
-        ? QStringLiteral("color: #15803d;")
-        : QStringLiteral("color: #dc2626;"));
+    audioEngineStatusLabel->setText(installed ? QStringLiteral("已安装") : QStringLiteral("未检测到安装"));
+    audioEngineStatusLabel->setStyleSheet(installed ? QStringLiteral("color: #15803d;") : QStringLiteral("color: #dc2626;"));
     audioEnginePathLabel->setText(installed
         ? QStringLiteral("安装路径：%1").arg(installPath)
         : QStringLiteral("安装路径：未检测到安装路径"));
     audioEnginePathLabel->setWordWrap(true);
-    audioEnginePathLabel->setStyleSheet(installed
-        ? QStringLiteral("color: #374151;")
-        : QStringLiteral("color: #6b7280;"));
+    audioEnginePathLabel->setStyleSheet(installed ? QStringLiteral("color: #374151;") : QStringLiteral("color: #6b7280;"));
     restartAudioEngineCheck->setToolTip(!installed
         ? QStringLiteral("未检测到 Voicemeeter，安装后才能使用这个选项。")
         : (remoteApiAvailable
@@ -513,7 +489,6 @@ void MainWindow::updateAudioEngineOptionState()
 
 void MainWindow::updateAutoStart(bool enabled)
 {
-    // 开机自启通过当前用户 Run 注册表项控制。
     QSettings runSettings(QString::fromWCharArray(kAutoStartRegistryPath), QSettings::NativeFormat);
     const QString key = applicationDisplayName();
 
@@ -527,13 +502,11 @@ void MainWindow::updateAutoStart(bool enabled)
 
 void MainWindow::clearDevices()
 {
-    // 设备接口统一交给 AudioDeviceManager 释放。
     audioDeviceManager.releaseDevices(devices);
 }
 
 void MainWindow::refreshDevices(bool showVirtual)
 {
-    // 刷新控制页设备列表时，同时刷新设置页同步设备列表。
     unregisterVolumeCallback();
     clearDevices();
 
@@ -551,7 +524,6 @@ void MainWindow::refreshDevices(bool showVirtual)
 
 void MainWindow::updateSyncDeviceList()
 {
-    // 同步设备列表始终显示全部输出设备，并尽量保留已有勾选。
     const QStringList previouslyChecked = [&]() {
         QStringList checkedIds;
         for (int i = 0; i < syncDeviceList->count(); ++i) {
@@ -581,7 +553,6 @@ void MainWindow::updateSyncDeviceList()
 
 void MainWindow::updateControlLockState()
 {
-    // 开启同步模式后，控制页的设备选择改为只读。
     const bool syncEnabled = syncWindowsVolumeCheck->isChecked();
     deviceBox->setEnabled(!syncEnabled);
     showVirtualCheck->setEnabled(!syncEnabled);
@@ -590,7 +561,6 @@ void MainWindow::updateControlLockState()
 
 void MainWindow::registerVolumeCallbackForCurrentDevice()
 {
-    // 同步模式下只监听 Windows 默认播放设备，保证和系统音量条一致。
     unregisterVolumeCallback();
 
     if (!syncWindowsVolumeCheck->isChecked()) {
@@ -616,7 +586,6 @@ void MainWindow::registerVolumeCallbackForCurrentDevice()
 
 void MainWindow::unregisterVolumeCallback()
 {
-    // 切换模式或退出时，注销当前默认设备音量回调。
     if (callbackVolume && volumeCallback) {
         callbackVolume->UnregisterControlChangeNotify(volumeCallback);
     }
@@ -634,7 +603,6 @@ void MainWindow::unregisterVolumeCallback()
 
 void MainWindow::registerDeviceNotifications()
 {
-    // 注册系统音频设备变更通知，让界面可以自动刷新。
     unregisterDeviceNotifications();
 
     notificationEnumerator = audioDeviceManager.createNotificationEnumerator();
@@ -654,7 +622,6 @@ void MainWindow::registerDeviceNotifications()
 
 void MainWindow::unregisterDeviceNotifications()
 {
-    // 退出前或重新注册前，先解除旧的设备通知回调。
     if (notificationEnumerator && deviceNotificationCallback) {
         notificationEnumerator->UnregisterEndpointNotificationCallback(deviceNotificationCallback);
     }
@@ -672,7 +639,6 @@ void MainWindow::unregisterDeviceNotifications()
 
 void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
 {
-    // 将统一后的目标音量广播给设置页勾选的所有同步设备。
     if (!syncWindowsVolumeCheck->isChecked()) {
         return;
     }
@@ -692,7 +658,6 @@ void MainWindow::applyVolumeToSelectedDevices(float volumeScalar)
 
 void MainWindow::handleExternalVolumeChange(float volumeScalar)
 {
-    // 这是 Windows 音量变化进入软件后的统一入口。
     if (!syncWindowsVolumeCheck->isChecked()) {
         return;
     }
@@ -706,7 +671,6 @@ void MainWindow::handleExternalVolumeChange(float volumeScalar)
 
 void MainWindow::appendDeviceEventLog(const QString &message)
 {
-    // 日志只保留在内存中，最多 100 条。
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
     deviceEventLogs.append(QStringLiteral("[%1] %2").arg(timestamp, message));
 
@@ -728,8 +692,8 @@ void MainWindow::appendDeviceEventLog(const QString &eventKey, const QString &me
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     const qint64 lastTimestamp = deviceEventLogTimestamps.value(eventKey, 0);
 
-    // 系统会在极短时间内重复抛出同类事件，这里做一次轻量去重。
-    if (lastTimestamp > 0 && now - lastTimestamp < 1200) {
+    // 系统会在短时间内重复抛出同类事件，这里按时间窗口去重。
+    if (lastTimestamp > 0 && now - lastTimestamp < kDeviceLogDedupWindowMs) {
         return;
     }
 
@@ -739,7 +703,6 @@ void MainWindow::appendDeviceEventLog(const QString &eventKey, const QString &me
 
 QString MainWindow::describeDeviceForLog(const QString &deviceId) const
 {
-    // 优先显示设备友好名称；如果设备已经消失，就退回到压缩后的 ID，至少还能定位。
     const QString name = audioDeviceManager.readDeviceNameById(deviceId).trimmed();
     if (!name.isEmpty()) {
         return name;
@@ -758,9 +721,9 @@ QString MainWindow::describeDeviceForLog(const QString &deviceId) const
 
 void MainWindow::clearDeviceEventLogs()
 {
-    // 清空日志时同时重置去重时间，避免清空后新事件被旧节流状态吞掉。
     deviceEventLogs.clear();
     deviceEventLogTimestamps.clear();
+    lastVoicemeeterRestartRequestMs = 0;
 
     if (deviceLogList) {
         deviceLogList->clear();
@@ -769,7 +732,6 @@ void MainWindow::clearDeviceEventLogs()
 
 void MainWindow::handleDeviceListChanged()
 {
-    // 多个系统通知会在短时间连续触发，这里统一交给定时器做防抖刷新。
     if (deviceRefreshTimer) {
         deviceRefreshTimer->start();
     }
@@ -779,7 +741,6 @@ void MainWindow::handleDeviceListChanged()
 
 void MainWindow::scheduleVoicemeeterRestart()
 {
-    // 设备热插拔时常常连发多次通知，这里延后 3 秒，只重启一次。
     if (!restartAudioEngineCheck || !restartAudioEngineCheck->isChecked()) {
         return;
     }
@@ -789,6 +750,15 @@ void MainWindow::scheduleVoicemeeterRestart()
         return;
     }
 
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (lastVoicemeeterRestartRequestMs > 0
+        && now - lastVoicemeeterRestartRequestMs < kVoicemeeterRestartWindowMs) {
+        appendDeviceEventLog(QStringLiteral("voicemeeter-restart-skipped"),
+                             QStringLiteral("Voicemeeter audio engine 重启请求已在时间窗口内，已跳过重复触发"));
+        return;
+    }
+
+    lastVoicemeeterRestartRequestMs = now;
     if (voicemeeterRestartTimer) {
         voicemeeterRestartTimer->start();
     }
@@ -796,21 +766,21 @@ void MainWindow::scheduleVoicemeeterRestart()
 
 void MainWindow::restartVoicemeeterAudioEngine()
 {
-    // 使用官方 Remote API 发送 Command.Restart，让 Voicemeeter 重新初始化输入输出设备。
     const QString installPath = findVoicemeeterInstallPath();
     QString errorMessage;
     if (!voicemeeterRemoteClient.restartAudioEngine(installPath, &errorMessage)) {
         qWarning() << "Voicemeeter restart failed:" << errorMessage;
-        appendDeviceEventLog(QStringLiteral("Voicemeeter audio engine 重启失败"));
+        appendDeviceEventLog(QStringLiteral("voicemeeter-restart-failed"),
+                             QStringLiteral("Voicemeeter audio engine 重启失败"));
         return;
     }
 
-    appendDeviceEventLog(QStringLiteral("Voicemeeter audio engine 已重启"));
+    appendDeviceEventLog(QStringLiteral("voicemeeter-restarted"),
+                         QStringLiteral("Voicemeeter audio engine 已重启"));
 }
 
 void MainWindow::onDeviceChanged(int index)
 {
-    // 非同步模式跟随当前设备，同步模式跟随 Windows 默认音量。
     if (index < 0 || index >= static_cast<int>(devices.size())) {
         slider->blockSignals(true);
         slider->setValue(0);
@@ -846,7 +816,6 @@ void MainWindow::onDeviceChanged(int index)
 
 void MainWindow::onSliderChanged(int value)
 {
-    // 滑条是软件唯一的音量输入源，模式不同会走不同控制路径。
     const float volumeScalar = static_cast<float>(value) / 100.0f;
 
     if (syncWindowsVolumeCheck->isChecked()) {
@@ -872,7 +841,6 @@ void MainWindow::onSliderChanged(int value)
 
 void MainWindow::loadDevices(bool showVirtual)
 {
-    // 重新加载控制页设备，并同步滑条到新的首项或默认状态。
     refreshDevices(showVirtual);
     updateControlLockState();
 
@@ -887,7 +855,6 @@ void MainWindow::loadDevices(bool showVirtual)
 
 void MainWindow::onSyncWindowsVolumeToggled(bool checked)
 {
-    // 切换同步模式时，同时更新 UI 锁定状态和音量回调绑定关系。
     syncDeviceHintLabel->setEnabled(checked);
     syncDeviceList->setEnabled(checked);
     updateControlLockState();
@@ -908,6 +875,5 @@ void MainWindow::onSyncWindowsVolumeToggled(bool checked)
 
 void MainWindow::onAutoStartToggled(bool checked)
 {
-    // 用户勾选变化后立即写回系统设置。
     updateAutoStart(checked);
 }
