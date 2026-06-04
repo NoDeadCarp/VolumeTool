@@ -70,8 +70,8 @@ public:
 private:
     // 把系统设备变化事件合并后转发给主窗口刷新。
     void scheduleRefresh();
-    // 判断设备属于输入还是输出方向，并通知主窗口。
-    void notifyDeviceChange(LPCWSTR pwstrDeviceId);
+    // 判断设备属于输入还是输出方向，并通知主窗口。action 为 "connect"/"disconnect" 或空。
+    void notifyDeviceChange(LPCWSTR pwstrDeviceId, const QString &action);
     // 判断设备 ID 是否对应虚拟设备，用于过滤日志。
     bool isVirtualDeviceId(LPCWSTR pwstrDeviceId) const;
 
@@ -101,8 +101,8 @@ public:
     void clearDeviceEventLogs();
     // 处理来自系统设备通知的列表刷新请求。
     void handleDeviceListChanged();
-    // 处理来自系统设备通知的 Voicemeeter 重启调度请求，direction 已由回调线程查询。
-    void handleDeviceChangeForRestart(const QString &deviceId, const QString &direction);
+    // 处理来自系统设备通知的 Voicemeeter 重启调度请求，direction 和 action 已由回调线程查询。
+    void handleDeviceChangeForRestart(const QString &deviceId, const QString &direction, const QString &action);
     // 返回音频设备管理器的引用，供回调线程查询设备方向。
     AudioDeviceManager &audioDeviceMgr() { return audioDeviceManager; }
     // 返回已缓存的设备方向信息，用于设备已断开时仍能判断方向。
@@ -125,8 +125,10 @@ private:
     QLabel *syncDeviceHintLabel;
     QListWidget *syncDeviceList;
 
-    QCheckBox *restartAudioEngineOnRenderCheck;
-    QCheckBox *restartAudioEngineOnCaptureCheck;
+    QCheckBox *restartAudioEngineOnRenderConnectCheck;
+    QCheckBox *restartAudioEngineOnRenderDisconnectCheck;
+    QCheckBox *restartAudioEngineOnCaptureConnectCheck;
+    QCheckBox *restartAudioEngineOnCaptureDisconnectCheck;
     QLabel *audioEngineStatusLabel;
     QLabel *audioEnginePathLabel;
     QPushButton *manualRestartAudioEngineButton;
@@ -151,10 +153,12 @@ private:
     QMap<QString, qint64> deviceEventLogTimestamps;
     // 记录每个事件 key 对应的日志索引，用于在去重窗口内更新已有日志。
     QMap<QString, int> deviceEventLogIndices;
-    // 记录最近一次 Voicemeeter 重启请求时间，避免短时间重复重启。
-    qint64 lastVoicemeeterRestartRequestMs = 0;
-    // 记录最近一次触发重启的设备方向，用于日志中区分。
+    // 记录最近一次 Voicemeeter 重启请求时间（按 direction-action 维度），避免同一事件短时间重复重启。
+    // 不同事件（如"输出设备断开"和"输出设备连接"）互不影响。
+    QMap<QString, qint64> lastVoicemeeterRestartPerAction;
+    // 记录最近一次触发重启的设备方向+状态，用于日志中区分和蓝牙耳机合并。
     QString lastVoicemeeterRestartDirection;
+    QString lastVoicemeeterRestartAction;
     // 缓存已知设备的方向（"render" 或 "capture"），设备移除后仍可查询。
     QMap<QString, QString> deviceDirectionCache;
     AudioDeviceManager audioDeviceManager;
@@ -194,10 +198,11 @@ private:
     // 将一个音量值广播到设置页勾选的所有设备。
     void applyVolumeToSelectedDevices(float volumeScalar);
     // 在设备频繁变动时合并多次请求，延迟重启 Voicemeeter audio engine。
-    // direction 用于标识触发来源："render"（输出）或 "capture"（输入）。
-    void scheduleVoicemeeterRestart(const QString &direction);
+    // direction 标识方向："render"/"capture"/"all"，action 标识动作："connect"/"disconnect"。
+    void scheduleVoicemeeterRestart(const QString &direction, const QString &action);
     // 通过 Voicemeeter Remote API 真正执行 audio engine 重启。
-    void restartVoicemeeterAudioEngine();
+    // isManual 为 true 时跳过防抖检查，日志标注"手动"。
+    void restartVoicemeeterAudioEngine(bool isManual = false);
     // 返回软件在注册表里使用的显示名称。
     QString applicationDisplayName() const;
 
