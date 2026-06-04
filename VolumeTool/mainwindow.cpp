@@ -1000,11 +1000,24 @@ void MainWindow::scheduleVoicemeeterRestart(const QString &direction, const QStr
 
     // 合并方向和动作：蓝牙耳机连接时 Windows 会先触发 render+connect 再触发 capture+connect，
     // 定时器延迟内合并为 all+connect，只重启一次。
+    // 快速插拔时，后面的"连接"事件应覆盖前面的"断开"，日志取最后的状态。
     if (lastVoicemeeterRestartDirection.isEmpty()) {
         lastVoicemeeterRestartDirection = direction;
         lastVoicemeeterRestartAction = action;
     } else if (action == lastVoicemeeterRestartAction) {
         // 同一动作下合并方向：render + capture → all
+        if (direction != lastVoicemeeterRestartDirection
+            && direction != QStringLiteral("all")
+            && lastVoicemeeterRestartDirection != QStringLiteral("all")) {
+            if ((direction == QStringLiteral("render") && lastVoicemeeterRestartDirection == QStringLiteral("capture"))
+                || (direction == QStringLiteral("capture") && lastVoicemeeterRestartDirection == QStringLiteral("render"))) {
+                lastVoicemeeterRestartDirection = QStringLiteral("all");
+            }
+        }
+    } else {
+        // 不同动作（快速拔插：先断开再连接），后面的覆盖前面的。
+        lastVoicemeeterRestartAction = action;
+        // 方向不同时也合并。
         if (direction != lastVoicemeeterRestartDirection
             && direction != QStringLiteral("all")
             && lastVoicemeeterRestartDirection != QStringLiteral("all")) {
