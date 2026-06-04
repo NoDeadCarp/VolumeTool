@@ -121,13 +121,28 @@ DeviceNotificationCallback::DeviceNotificationCallback(MainWindow *owner)
 
 HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR deviceId)
 {
-    if (flow == eRender && role == eConsole) {
+    Q_UNUSED(role)
+    if (flow == eRender || flow == eCapture || flow == eAll) {
         if (owner) {
+            const QString directionLabel = (flow == eCapture)
+                ? QStringLiteral("默认输入设备已变动")
+                : (flow == eAll)
+                    ? QStringLiteral("默认输入输出设备已变动")
+                    : QStringLiteral("默认输出设备已变动");
+            const QString logKey = (flow == eCapture)
+                ? QStringLiteral("default-capture:%1").arg(deviceEventId(deviceId))
+                : (flow == eAll)
+                    ? QStringLiteral("default-all:%1").arg(deviceEventId(deviceId))
+                    : QStringLiteral("default-render:%1").arg(deviceEventId(deviceId));
             const QString deviceText = deviceDisplayText(owner, deviceId);
-            owner->appendDeviceEventLog(QStringLiteral("default-render:%1").arg(deviceEventId(deviceId)),
-                                        QStringLiteral("默认输出设备已变动：%1").arg(deviceText));
+            owner->appendDeviceEventLog(logKey,
+                                        QStringLiteral("%1：%2").arg(directionLabel, deviceText));
         }
-        scheduleRefresh();
+
+        // 统一通过 notifyDeviceChange 查询设备真实方向，而非使用 flow 参数。
+        // 因为拔出音响时 Windows 可能同时触发 eCapture 的默认设备变化（如 Voicemeeter 虚拟输入联动），
+        // 导致纯输出设备被误判为输入设备。
+        notifyDeviceChange(deviceId);
     }
     return S_OK;
 }
@@ -139,7 +154,7 @@ HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceAdded(LPCWSTR devi
         owner->appendDeviceEventLog(QStringLiteral("device-added:%1").arg(deviceEventId(deviceId)),
                                     QStringLiteral("检测到新设备加入：%1").arg(deviceText));
     }
-    scheduleRefresh();
+    notifyDeviceChange(deviceId);
     return S_OK;
 }
 
@@ -150,7 +165,7 @@ HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceRemoved(LPCWSTR de
         owner->appendDeviceEventLog(QStringLiteral("device-removed:%1").arg(deviceEventId(deviceId)),
                                     QStringLiteral("检测到设备被移除：%1").arg(deviceText));
     }
-    scheduleRefresh();
+    notifyDeviceChange(deviceId);
     return S_OK;
 }
 
@@ -161,15 +176,14 @@ HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnDeviceStateChanged(LPCWS
         owner->appendDeviceEventLog(QStringLiteral("device-state:%1:%2").arg(deviceEventId(deviceId)).arg(newState),
                                     QStringLiteral("%1 状态变为：%2").arg(deviceText, deviceStateToText(newState)));
     }
-    scheduleRefresh();
+    notifyDeviceChange(deviceId);
     return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceNotificationCallback::OnPropertyValueChanged(LPCWSTR deviceId, const PROPERTYKEY key)
 {
-    Q_UNUSED(deviceId)
     Q_UNUSED(key)
-    scheduleRefresh();
+    notifyDeviceChange(deviceId);
     return S_OK;
 }
 
@@ -216,6 +230,70 @@ void DeviceNotificationCallback::scheduleRefresh()
     }, Qt::QueuedConnection);
 }
 
+void DeviceNotificationCallback::notifyDeviceChange(LPCWSTR pwstrDeviceId)
+{
+    // 在 COM 回调线程中直接查询设备方向，避免延迟到 UI 线程后设备已消失导致查询失败。
+    const QString deviceId = pwstrDeviceId ? QString::fromWCharArray(pwstrDeviceId) : QString();
+    QString direction;
+
+    if (!deviceId.isEmpty()) {
+        // 先尝试实时查询设备方向。
+        IMMDeviceEnumerator *enumerator = nullptr;
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                      nullptr,
+                                      CLSCTX_ALL,
+                                      __uuidof(IMMDeviceEnumerator),
+                                      reinterpret_cast<void **>(&enumerator));
+        if (SUCCEEDED(hr) && enumerator) {
+            IMMDevice *device = nullptr;
+            const std::wstring wideId = deviceId.toStdWString();
+            hr = enumerator->GetDevice(wideId.c_str(), &device);
+            enumerator->Release();
+            if (SUCCEEDED(hr) && device) {
+                // 跳过虚拟设备（Voicemeeter 等），它们的变动只是物理设备变化的联动结果。
+                if (owner && owner->audioDeviceMgr().isVirtualDevice(device)) {
+                    device->Release();
+                    scheduleRefresh();
+                    return;
+                }
+
+                const EDataFlow dataFlow = owner->audioDeviceMgr().getDeviceDataFlow(device);
+                device->Release();
+                direction = (dataFlow == eCapture) ? QStringLiteral("capture")
+                          : (dataFlow == eAll) ? QStringLiteral("all")
+                          : QStringLiteral("render");
+            }
+        }
+
+        // 设备已断开/移除时 GetDevice 会失败，使用缓存的方向信息。
+        // 同时也跳过缓存中的虚拟设备。
+        if (direction.isEmpty() && owner) {
+            const QString cached = owner->cachedDeviceDirection(deviceId);
+            if (cached == QStringLiteral("virtual")) {
+                scheduleRefresh();
+                return;
+            }
+            if (!cached.isEmpty()) {
+                direction = cached;
+            }
+        }
+    }
+
+    if (direction.isEmpty()) {
+        direction = QStringLiteral("render");
+    }
+
+    if (owner) {
+        QMetaObject::invokeMethod(owner, [this, deviceId, direction]() {
+            if (owner) {
+                owner->handleDeviceChangeForRestart(deviceId, direction);
+            }
+        }, Qt::QueuedConnection);
+    }
+
+    scheduleRefresh();
+}
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent),
       tabWidget(new QTabWidget(this)),
@@ -231,7 +309,8 @@ MainWindow::MainWindow(QWidget *parent)
       syncWindowsVolumeCheck(new QCheckBox(QStringLiteral("同步 Windows 音量滑轨"), this)),
       syncDeviceHintLabel(new QLabel(QStringLiteral("勾选后可选择需要跟随软件一起同步的设备。"), this)),
       syncDeviceList(new QListWidget(this)),
-      restartAudioEngineCheck(new QCheckBox(QStringLiteral("设备变动时重启 audio engine"), this)),
+      restartAudioEngineOnRenderCheck(new QCheckBox(QStringLiteral("输出设备变动时重启 audio engine"), this)),
+      restartAudioEngineOnCaptureCheck(new QCheckBox(QStringLiteral("输入设备变动时重启 audio engine"), this)),
       audioEngineStatusLabel(new QLabel(this)),
       audioEnginePathLabel(new QLabel(this)),
       manualRestartAudioEngineButton(new QPushButton(QStringLiteral("手动重启 audio engine"), this)),
@@ -321,7 +400,8 @@ void MainWindow::setupUi()
 
     auto *voicemeeterActionGroup = new QGroupBox(QStringLiteral("Voicemeeter 功能"), voicemeeterPage);
     auto *voicemeeterActionLayout = new QVBoxLayout(voicemeeterActionGroup);
-    voicemeeterActionLayout->addWidget(restartAudioEngineCheck);
+    voicemeeterActionLayout->addWidget(restartAudioEngineOnRenderCheck);
+    voicemeeterActionLayout->addWidget(restartAudioEngineOnCaptureCheck);
     voicemeeterActionLayout->addWidget(manualRestartAudioEngineButton);
 
     auto *deviceLogGroup = new QGroupBox(QStringLiteral("设备变动日志"), voicemeeterPage);
@@ -467,7 +547,8 @@ void MainWindow::updateAudioEngineOptionState()
     const bool installed = !installPath.isEmpty();
     const bool remoteApiAvailable = installed && isVoicemeeterRemoteApiAvailable(installPath);
 
-    restartAudioEngineCheck->setEnabled(remoteApiAvailable);
+    restartAudioEngineOnRenderCheck->setEnabled(remoteApiAvailable);
+    restartAudioEngineOnCaptureCheck->setEnabled(remoteApiAvailable);
     audioEngineStatusLabel->setText(installed ? QStringLiteral("已安装") : QStringLiteral("未检测到安装"));
     audioEngineStatusLabel->setStyleSheet(installed ? QStringLiteral("color: #15803d;") : QStringLiteral("color: #dc2626;"));
     audioEnginePathLabel->setText(installed
@@ -475,15 +556,20 @@ void MainWindow::updateAudioEngineOptionState()
         : QStringLiteral("安装路径：未检测到安装路径"));
     audioEnginePathLabel->setWordWrap(true);
     audioEnginePathLabel->setStyleSheet(installed ? QStringLiteral("color: #374151;") : QStringLiteral("color: #6b7280;"));
-    restartAudioEngineCheck->setToolTip(!installed
+
+    const QString commonToolTip = !installed
         ? QStringLiteral("未检测到 Voicemeeter，安装后才能使用这个选项。")
         : (remoteApiAvailable
             ? QStringLiteral("检测到 Remote API，可在设备变动 3 秒后自动重启 audio engine。")
-            : QStringLiteral("检测到 Voicemeeter，但未找到 Remote API DLL。")));
+            : QStringLiteral("检测到 Voicemeeter，但未找到 Remote API DLL。"));
+    restartAudioEngineOnRenderCheck->setToolTip(commonToolTip);
+    restartAudioEngineOnCaptureCheck->setToolTip(commonToolTip);
 
     if (!remoteApiAvailable) {
-        QSignalBlocker blocker(restartAudioEngineCheck);
-        restartAudioEngineCheck->setChecked(false);
+        QSignalBlocker renderBlocker(restartAudioEngineOnRenderCheck);
+        QSignalBlocker captureBlocker(restartAudioEngineOnCaptureCheck);
+        restartAudioEngineOnRenderCheck->setChecked(false);
+        restartAudioEngineOnCaptureCheck->setChecked(false);
     }
 }
 
@@ -517,6 +603,31 @@ void MainWindow::refreshDevices(bool showVirtual)
     devices = audioDeviceManager.loadRenderDevices(showVirtual);
     for (const auto &device : devices) {
         deviceBox->addItem(device.name);
+    }
+
+    // 刷新设备方向缓存：渲染设备标记为 render，录音设备标记为 capture，
+    // 同时出现在两边的设备（如带麦克风的 USB 耳机）标记为 all，
+    // 虚拟设备标记为 virtual（插拔物理设备时虚拟设备的联动变化应忽略）。
+    deviceDirectionCache.clear();
+    for (const auto &device : devices) {
+        if (device.isVirtual) {
+            deviceDirectionCache.insert(device.id, QStringLiteral("virtual"));
+        } else {
+            deviceDirectionCache.insert(device.id, QStringLiteral("render"));
+        }
+    }
+    const auto captureSnapshots = audioDeviceManager.loadAllCaptureDeviceSnapshots();
+    for (const auto &snapshot : captureSnapshots) {
+        if (snapshot.isVirtual) {
+            deviceDirectionCache.insert(snapshot.id, QStringLiteral("virtual"));
+            continue;
+        }
+        auto it = deviceDirectionCache.find(snapshot.id);
+        if (it != deviceDirectionCache.end() && it.value() == QStringLiteral("render")) {
+            it.value() = QStringLiteral("all");
+        } else {
+            deviceDirectionCache.insert(snapshot.id, QStringLiteral("capture"));
+        }
     }
 
     updateSyncDeviceList();
@@ -735,13 +846,35 @@ void MainWindow::handleDeviceListChanged()
     if (deviceRefreshTimer) {
         deviceRefreshTimer->start();
     }
-
-    scheduleVoicemeeterRestart();
 }
 
-void MainWindow::scheduleVoicemeeterRestart()
+void MainWindow::handleDeviceChangeForRestart(const QString &deviceId, const QString &direction)
 {
-    if (!restartAudioEngineCheck || !restartAudioEngineCheck->isChecked()) {
+    // 方向已由 COM 回调线程提前查询，这里直接使用。
+    Q_UNUSED(deviceId)
+    scheduleVoicemeeterRestart(direction);
+}
+
+QString MainWindow::cachedDeviceDirection(const QString &deviceId) const
+{
+    return deviceDirectionCache.value(deviceId, QString());
+}
+
+void MainWindow::scheduleVoicemeeterRestart(const QString &direction)
+{
+    // 根据设备方向检查对应的 checkbox。
+    // "all" 方向的设备（如带麦克风的 USB 耳机）同时检查两个 checkbox，任一勾选即触发。
+    const bool isAll = (direction == QStringLiteral("all"));
+    const bool isRender = (direction == QStringLiteral("render"));
+    QCheckBox *renderCheck = isAll ? restartAudioEngineOnRenderCheck
+                         : isRender ? restartAudioEngineOnRenderCheck
+                         : nullptr;
+    QCheckBox *captureCheck = isAll ? restartAudioEngineOnCaptureCheck
+                            : !isRender ? restartAudioEngineOnCaptureCheck
+                            : nullptr;
+    const bool shouldRestart = (renderCheck && renderCheck->isChecked())
+                            || (captureCheck && captureCheck->isChecked());
+    if (!shouldRestart) {
         return;
     }
 
@@ -753,12 +886,19 @@ void MainWindow::scheduleVoicemeeterRestart()
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (lastVoicemeeterRestartRequestMs > 0
         && now - lastVoicemeeterRestartRequestMs < kVoicemeeterRestartWindowMs) {
-        appendDeviceEventLog(QStringLiteral("voicemeeter-restart-skipped"),
-                             QStringLiteral("Voicemeeter audio engine 重启请求已在时间窗口内，已跳过重复触发"));
+        // 在防抖窗口内收到新请求时，合并方向而非直接跳过。
+        // 例如先收到 render 再收到 capture，合并为 all。
+        if (direction != lastVoicemeeterRestartDirection) {
+            if ((direction == QStringLiteral("render") && lastVoicemeeterRestartDirection == QStringLiteral("capture"))
+                || (direction == QStringLiteral("capture") && lastVoicemeeterRestartDirection == QStringLiteral("render"))) {
+                lastVoicemeeterRestartDirection = QStringLiteral("all");
+            }
+        }
         return;
     }
 
     lastVoicemeeterRestartRequestMs = now;
+    lastVoicemeeterRestartDirection = direction;
     if (voicemeeterRestartTimer) {
         voicemeeterRestartTimer->start();
     }
@@ -767,16 +907,22 @@ void MainWindow::scheduleVoicemeeterRestart()
 void MainWindow::restartVoicemeeterAudioEngine()
 {
     const QString installPath = findVoicemeeterInstallPath();
+    const QString directionText = lastVoicemeeterRestartDirection == QStringLiteral("capture")
+        ? QStringLiteral("输入设备")
+        : lastVoicemeeterRestartDirection == QStringLiteral("all")
+            ? QStringLiteral("输入输出设备")
+            : QStringLiteral("输出设备");
+
     QString errorMessage;
     if (!voicemeeterRemoteClient.restartAudioEngine(installPath, &errorMessage)) {
         qWarning() << "Voicemeeter restart failed:" << errorMessage;
         appendDeviceEventLog(QStringLiteral("voicemeeter-restart-failed"),
-                             QStringLiteral("Voicemeeter audio engine 重启失败"));
+                             QStringLiteral("Voicemeeter audio engine 重启失败（触发来源：%1变动）").arg(directionText));
         return;
     }
 
     appendDeviceEventLog(QStringLiteral("voicemeeter-restarted"),
-                         QStringLiteral("Voicemeeter audio engine 已重启"));
+                         QStringLiteral("Voicemeeter audio engine 已重启（触发来源：%1变动）").arg(directionText));
 }
 
 void MainWindow::onDeviceChanged(int index)

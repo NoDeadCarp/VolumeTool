@@ -28,6 +28,8 @@ public:
     std::vector<AudioDeviceEntry> loadRenderDevices(bool includeVirtual) const;
     // 获取所有播放设备的轻量信息，供设置页列表展示。
     std::vector<AudioDeviceSnapshot> loadAllRenderDeviceSnapshots() const;
+    // 获取所有录音设备的轻量信息，供缓存设备方向。
+    std::vector<AudioDeviceSnapshot> loadAllCaptureDeviceSnapshots() const;
     // 释放枚举阶段缓存的 COM 设备接口。
     void releaseDevices(std::vector<AudioDeviceEntry> &devices) const;
 
@@ -43,6 +45,12 @@ public:
     bool setDeviceVolumeById(const QString &deviceId, float volumeScalar, const GUID *eventContext = nullptr) const;
     // 通过设备 ID 读取当前系统里的友好名称，供日志和调试显示。
     QString readDeviceNameById(const QString &deviceId) const;
+    // 通过 IMMDevice 指针查询数据流方向，用于回调线程中直接获取。
+    EDataFlow getDeviceDataFlow(IMMDevice *device) const;
+    // 通过设备 ID 查询数据流方向，返回 eRender 或 eCapture；查询失败返回 eRender。
+    EDataFlow getDeviceDataFlow(const QString &deviceId) const;
+    // 判断设备是否为虚拟设备（Voicemeeter 等），用于过滤联动变动。
+    bool isVirtualDevice(IMMDevice *device) const;
     // 创建用于监听系统音频设备变化的枚举器。
     IMMDeviceEnumerator *createNotificationEnumerator() const;
 
@@ -53,6 +61,4 @@ private:
     QString readDeviceName(IMMDevice *device) const;
     // 读取设备唯一 ID。
     QString readDeviceId(IMMDevice *device) const;
-    // 根据名称和 ID 判断该设备是否属于常见虚拟设备。
-    bool isVirtualDevice(IMMDevice *device) const;
 };
