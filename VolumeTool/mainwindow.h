@@ -72,6 +72,8 @@ private:
     void scheduleRefresh();
     // 判断设备属于输入还是输出方向，并通知主窗口。
     void notifyDeviceChange(LPCWSTR pwstrDeviceId);
+    // 判断设备 ID 是否对应虚拟设备，用于过滤日志。
+    bool isVirtualDeviceId(LPCWSTR pwstrDeviceId) const;
 
     std::atomic<ULONG> refCount{1};
     MainWindow *owner;
@@ -138,6 +140,7 @@ private:
     DeviceNotificationCallback *deviceNotificationCallback = nullptr;
     IMMDeviceEnumerator *notificationEnumerator = nullptr;
     QTimer *deviceRefreshTimer = nullptr;
+    // 合并短时间内多个设备变化事件后再执行重启，避免蓝牙耳机连接时 render/capture 分别触发两次重启。
     QTimer *voicemeeterRestartTimer = nullptr;
 
     // 控制页当前可直接操作的设备列表。
@@ -146,6 +149,8 @@ private:
     QStringList deviceEventLogs;
     // 记录最近一次各类设备事件的时间，用来抑制高频重复日志。
     QMap<QString, qint64> deviceEventLogTimestamps;
+    // 记录每个事件 key 对应的日志索引，用于在去重窗口内更新已有日志。
+    QMap<QString, int> deviceEventLogIndices;
     // 记录最近一次 Voicemeeter 重启请求时间，避免短时间重复重启。
     qint64 lastVoicemeeterRestartRequestMs = 0;
     // 记录最近一次触发重启的设备方向，用于日志中区分。

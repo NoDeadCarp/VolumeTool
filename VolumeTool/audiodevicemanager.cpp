@@ -87,8 +87,12 @@ bool AudioDeviceManager::isVirtualDevice(IMMDevice *device) const
     return name.contains("Virtual", Qt::CaseInsensitive)
         || name.contains("VB-Audio", Qt::CaseInsensitive)
         || name.contains("Voicemeeter", Qt::CaseInsensitive)
+        || name.contains("AMD High Definition Audio", Qt::CaseInsensitive)
+        || name.contains("NVIDIA High Definition Audio", Qt::CaseInsensitive)
+        || name.contains("NVIDIA Virtual Audio", Qt::CaseInsensitive)
         || id.startsWith("ROOT\\")
-        || id.contains("SWD\\");
+        || id.contains("SWD\\")
+        || id.contains("HDAUDIO\\", Qt::CaseInsensitive);
 }
 
 std::vector<AudioDeviceEntry> AudioDeviceManager::loadRenderDevices(bool includeVirtual) const
