@@ -17,6 +17,7 @@ compile_commands.json
 # IDE
 .vs/
 .vscode/
+.idea/
 *.pro.user
 *.qtc_clangd/
 
